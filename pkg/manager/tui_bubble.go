@@ -1,0 +1,4630 @@
+package manager
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+	"tmux-ssh-manager/pkg/sessionfmt"
+
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+// RunTUI launches the Bubble Tea TUI with vim-like motions, incremental search,
+// and tmux-aware actions. It replaces the classic line-oriented TUI.
+// - Vim motions: j/k to move, gg to top, G to bottom, u/d half-page
+// - Enter or c: connect in current pane
+// - v: split vertically (side-by-side) and connect (tmux split-window -h)
+// - s: split horizontally (stacked) and connect (tmux split-window -v)
+// - w: new window and connect
+// - y: yank the ssh command to tmux buffer
+// - /: focus search input; Esc: blur search input; ?: reverse-search; :help (or h): help; q: quit
+func RunTUI(cfg *Config, opts UIOptions) error {
+	if cfg == nil {
+		return fmt.Errorf("nil config")
+	}
+	if opts.MaxResults <= 0 {
+		opts.MaxResults = 20
+	}
+
+	// When launched from the tmux popup wrapper, force a sane TERM to help Bubble Tea render.
+	// The launcher sets TMUX_SSH_MANAGER_IN_POPUP=1 for popup launches.
+	//
+	// IMPORTANT (popup mode):
+	// Do NOT exec-replace the process with ssh.
+	// Instead, run ssh as a child process so the popup wrapper can capture session output
+	// via macOS `script -a <hostlog>` and then close the popup automatically on exit (-E).
+	if os.Getenv("TMUX_SSH_MANAGER_IN_POPUP") != "" {
+		_ = os.Setenv("TERM", "xterm-256color")
+		opts.ExecReplace = false
+	}
+
+	m := newModel(cfg, opts)
+	// Always force alt-screen for Bubble Tea.
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	_, err := p.Run()
+	return err
+}
+
+type model struct {
+	cfg        *Config
+	opts       UIOptions
+	input      textinput.Model
+	candidates []candidate
+	filtered   []candidate
+
+	selected        int
+	scroll          int
+	showHelp        bool
+	showDashBrowser bool
+	dashSelected    int
+	dashLayoutMode  int // 0=use dashboard layout; 1=tiled; 2=even-horizontal; 3=even-vertical; 4=main-vertical; 5=main-horizontal
+
+	// --- Minimal recorder (first-pass) ---
+	// Records commands that tmux-ssh-manager itself sends into panes via sendOnConnectToPaneLogged.
+	// This does NOT attempt to intercept keystrokes inside SSH.
+	recording            bool
+	recordingName        string
+	recordingDescription string
+	recordedPanes        map[string]*RecordedPane // key: pane_id ("%0"), value holds Host + Commands
+
+	// Pane-to-host mapping for panes created/managed by tmux-ssh-manager.
+	// This enables :send/:sendall and :dash save (snapshot) to associate panes with hosts.
+	paneHost map[string]string // key: pane_id ("%0") -> hostKey (Host.Name)
+
+	// Host Settings overlay (SecureCRT-like "session properties")
+	showHostSettings bool
+	hostSettingsSel  int
+
+	status string
+
+	// --- Logs viewer state ---
+	showLogs      bool
+	logHostKey    string
+	logFilePath   string
+	logFiles      []string
+	logSelected   int
+	logStartLine  int
+	logLines      []string
+	logTotalLines int
+
+	// view state
+	width    int
+	height   int
+	ready    bool
+	quitting bool
+
+	// vim helpers
+	pendingG bool
+
+	// Search direction for n/N (vim-like)
+	// - true: forward (n goes down)
+	// - false: backward (n goes up)
+	searchForward bool
+
+	// ":" command-line mode (SecureCRT-like command bar)
+	showCmdline bool
+	cmdline     textinput.Model
+
+	// Command bar helpers
+	cmdCandidates []string
+	cmdSuggestIdx int
+
+	// numeric quick-select buffer (e.g., "15" then Enter)
+	numBuf string
+
+	// ephemeral status timer
+	statusUntil time.Time
+
+	// favorites/recents and selection/modes
+	favorites       map[string]struct{}
+	recents         []string
+	filterFavorites bool
+	filterRecents   bool
+	selectedSet     map[int]struct{}
+
+	// tmux targets created during this session (to close on exit)
+	createdPaneIDs   []string
+	createdWindowIDs []string
+
+	// persistence
+	statePath string
+	state     *State
+	theme     Theme
+}
+
+func newModel(cfg *Config, opts UIOptions) model {
+	ti := textinput.New()
+	ti.Prompt = "/ "
+	ti.Placeholder = "search..."
+	ti.CharLimit = 256
+	ti.Cursor.Style = ti.Cursor.Style.Bold(true)
+	ti.SetValue(strings.TrimSpace(opts.InitialQuery))
+	ti.PromptStyle = ti.PromptStyle.Bold(true)
+
+	// ":" command bar (SecureCRT-like). Kept separate from search input.
+	ci := textinput.New()
+	ci.Prompt = ":"
+	ci.Placeholder = "menu"
+	ci.CharLimit = 256
+	ci.Cursor.Style = ci.Cursor.Style.Bold(true)
+	ci.PromptStyle = ci.PromptStyle.Bold(true)
+
+	cands := buildCandidates(cfg)
+	m := model{
+		cfg:             cfg,
+		opts:            opts,
+		input:           ti,
+		candidates:      cands,
+		filtered:        rankMatches(cands, ti.Value()),
+		selected:        0,
+		scroll:          0,
+		showHelp:        false,
+		searchForward:   true,
+		showCmdline:     false,
+		cmdline:         ci,
+		cmdCandidates:   nil,
+		cmdSuggestIdx:   -1,
+		showLogs:        false,
+		logSelected:     0,
+		logStartLine:    0,
+		logLines:        nil,
+		logTotalLines:   0,
+		favorites:       make(map[string]struct{}),
+		recents:         []string{},
+		filterFavorites: false,
+		filterRecents:   false,
+		selectedSet:     make(map[int]struct{}),
+
+		// recorder defaults
+		recording:            false,
+		recordingName:        "",
+		recordingDescription: "",
+		recordedPanes:        make(map[string]*RecordedPane),
+
+		// pane mapping defaults
+		paneHost: make(map[string]string),
+	}
+	// Load persistent favorites/recents state
+	if path, err := DefaultStatePath(); err == nil {
+		m.statePath = path
+	}
+	if st, err := LoadState(m.statePath); err == nil && st != nil {
+		m.state = st
+		if len(st.Favorites) > 0 {
+			for _, n := range st.Favorites {
+				n = strings.TrimSpace(n)
+				if n != "" {
+					m.favorites[n] = struct{}{}
+				}
+			}
+		}
+		if len(st.Recents) > 0 {
+			m.recents = append([]string(nil), st.Recents...)
+		}
+	}
+	m.theme = LoadTheme("")
+	return m
+}
+
+func (m model) Init() tea.Cmd {
+	return tea.Batch(tea.EnterAltScreen, textinput.Blink)
+}
+
+func (m *model) buildCmdCandidates() []string {
+	// Keep this list small, memorable, and discoverable (SecureCRT-like "command bar").
+	// Commands are space-delimited; most support abbreviations.
+	cands := []string{
+		"menu",
+		"help",
+		"h",
+		"q",
+		"quit",
+		"exit",
+
+		"search ",
+		"/ ",
+		"? ",
+		"clear",
+		"all",
+		"fav",
+		"favorites",
+		"recent",
+		"recents",
+
+		"dash",
+		"dash ",
+		"dash save ",
+		"dash export ",
+		"dash apply ",
+		"dash apply-file ",
+		"dashboard",
+		"dashboards",
+
+		// Send commands (records cleanly + works for NOC dashboards).
+		"send ",
+		"sendall ",
+
+		// Watch helpers (sugar over :send/:sendall).
+		// Usage:
+		//   :watch <interval_s> <cmd...>
+		//   :watchall <interval_s> <cmd...>
+		// interval_s is optional; defaults to 2.
+		"watch ",
+		"watchall ",
+
+		// Recorder (first-pass): captures commands tmux-ssh-manager sends into panes (not live keystrokes in SSH).
+		"record start ",
+		"record stop",
+		"record status",
+		"record save ",
+		"record delete ",
+
+		"connect",
+		"c",
+		"split v",
+		"split h",
+		"window",
+		"w",
+		"windows",
+
+		"logs",
+		"log toggle",
+		"log on",
+		"log off",
+
+		"login",
+		"login status",
+		"login askpass",
+		"login manual",
+
+		"cred status",
+		"cred set",
+		"cred delete",
+
+		"run ",
+	}
+	// Add macro names and dashboard names for discoverability.
+	if m.cfg != nil {
+		for _, mac := range m.cfg.Macros {
+			name := strings.TrimSpace(mac.Name)
+			if name != "" {
+				cands = append(cands, "run "+name)
+			}
+		}
+		for _, d := range m.cfg.Dashboards {
+			name := strings.TrimSpace(d.Name)
+			if name != "" {
+				cands = append(cands, "dash "+name)
+			}
+		}
+	}
+	// Add recorded dashboard names for discoverability (state.json).
+	if m.state != nil && len(m.state.RecordedDashboards) > 0 {
+		for _, rd := range m.state.RecordedDashboards {
+			name := strings.TrimSpace(rd.Name)
+			if name != "" {
+				cands = append(cands, "dash "+name)
+			}
+		}
+	}
+	sort.Strings(cands)
+	return cands
+}
+
+func (m *model) cmdSuggestions(prefix string) []string {
+	prefix = strings.ToLower(strings.TrimSpace(prefix))
+	if prefix == "" {
+		return nil
+	}
+	out := make([]string, 0, 10)
+	for _, c := range m.cmdCandidates {
+		if strings.HasPrefix(strings.ToLower(c), prefix) {
+			out = append(out, c)
+			if len(out) >= 10 {
+				break
+			}
+		}
+	}
+	return out
+}
+
+func (m *model) currentOrSelectedResolved() []ResolvedHost {
+	targets := m.selectedResolved()
+	if len(targets) == 0 {
+		if sel := m.current(); sel != nil {
+			targets = []ResolvedHost{sel.Resolved}
+		}
+	}
+	return targets
+}
+
+func (m *model) findMacro(name string) *Macro {
+	if m.cfg == nil {
+		return nil
+	}
+	name = strings.TrimSpace(name)
+	for i := range m.cfg.Macros {
+		if m.cfg.Macros[i].Name == name {
+			return &m.cfg.Macros[i]
+		}
+	}
+	return nil
+}
+
+// --- Update ---
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.ready = true
+		return m, nil
+
+	case tea.KeyMsg:
+		if handled, quit := m.handleGlobalKeys(msg); handled {
+			if quit {
+				return m.quit()
+			}
+			return m, nil
+		}
+
+		// Host Settings overlay: modal navigation + actions
+		if m.showHostSettings {
+			switch msg.String() {
+			case "esc", "q":
+				m.showHostSettings = false
+				m.pendingG = false
+				m.input.Blur()
+				m.recomputeFilter()
+				return m, tea.ClearScreen
+			case "j", "down":
+				if m.hostSettingsSel < 4 {
+					m.hostSettingsSel++
+				}
+				return m, nil
+			case "k", "up":
+				if m.hostSettingsSel > 0 {
+					m.hostSettingsSel--
+				}
+				return m, nil
+			case "enter":
+				// 0: Login mode toggle
+				// 1: Credential set
+				// 2: Credential delete
+				// 3: Logging toggle
+				// 4: Install my public key (authorized_keys)
+				if sel := m.current(); sel != nil {
+					hostKey := strings.TrimSpace(sel.Resolved.Host.Name)
+					if hostKey == "" {
+						m.setStatus("host settings: no host selected", 1500)
+						return m, nil
+					}
+
+					// Debug/status so it’s obvious Enter was handled and which action is being executed.
+
+					switch m.hostSettingsSel {
+					case 0:
+						// Toggle effective login mode via HostExtras auth_mode
+						ex, _ := LoadHostExtras(hostKey)
+						ex.HostKey = hostKey
+						am := strings.ToLower(strings.TrimSpace(ex.AuthMode))
+						if am == "" || am == "manual" {
+							ex.AuthMode = "keychain" // maps to askpass
+						} else {
+							ex.AuthMode = "manual"
+						}
+						if err := SaveHostExtras(ex); err != nil {
+							m.setStatus(fmt.Sprintf("login mode save failed: %v", err), 3500)
+							return m, nil
+						}
+
+						// Usability: if askpass was enabled, immediately warn if the Keychain credential is missing.
+						effective := m.effectiveLoginMode(sel.Resolved)
+						if strings.EqualFold(strings.TrimSpace(effective), "askpass") {
+							// Non-revealing existence check
+							if err := CredGet(hostKey, sel.Resolved.EffectiveUser, "password"); err != nil {
+								m.setStatus("login mode: askpass enabled, but no Keychain credential found — select 'Set credential (Keychain)' and press Enter", 5000)
+								return m, nil
+							}
+						}
+
+						m.setStatus(fmt.Sprintf("login mode: %s", effective), 2000)
+						return m, nil
+
+					case 1:
+						// Cred set: use a foreground tmux popup (best UX) and fall back to a window only if popup fails.
+						// Reset cursor/tty state in the popup so the prompt is usable.
+						userArg := strings.TrimSpace(sel.Resolved.EffectiveUser)
+						bin := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_BIN"))
+						if bin == "" {
+							bin = "tmux-ssh-manager"
+						}
+
+						userFlag := ""
+						if userArg != "" {
+							userFlag = "--user " + shellEscapeForSh(userArg)
+						}
+
+						// Prefer popup. -E closes automatically on success.
+						popupCmd := fmt.Sprintf(
+							"printf '\\033[?25h\\033[0m' >/dev/tty 2>/dev/null || true; stty sane </dev/tty >/dev/tty 2>/dev/null || true; %s cred set --host %s %s; rc=$?; echo; if [ $rc -eq 0 ]; then echo 'Saved to Keychain.'; exit 0; else echo 'FAILED (exit='$rc')'; echo; echo 'Press Enter to close...'; read -r _; exit $rc; fi",
+							shellEscapeForSh(bin),
+							shellEscapeForSh(hostKey),
+							userFlag,
+						)
+
+						popupErr := exec.Command(
+							"tmux", "display-popup",
+							"-E",
+							"-T", fmt.Sprintf("tmux-ssh-manager: credential for %s", hostKey),
+							"-w", "80%",
+							"-h", "60%",
+							"--",
+							"bash", "-lc", popupCmd,
+						).Run()
+
+						if popupErr != nil {
+							// Fallback: open a window for credential prompting; keep it open until the user confirms.
+							_ = exec.Command(
+								"tmux", "new-window",
+								"-n", "cred-set",
+								"bash", "-lc",
+								fmt.Sprintf(
+									"printf '\\033[?25h\\033[0m' >/dev/tty 2>/dev/null || true; stty sane </dev/tty >/dev/tty 2>/dev/null || true; %s cred set --host %s %s; rc=$?; echo; if [ $rc -eq 0 ]; then echo 'Saved to Keychain.'; else echo 'FAILED (exit='$rc')'; fi; echo; echo 'Press Enter to close...'; read -r _",
+									shellEscapeForSh(bin),
+									shellEscapeForSh(hostKey),
+									userFlag,
+								),
+							).Run()
+						}
+
+						// Refresh status (non-revealing) after returning.
+						if err := CredGet(hostKey, sel.Resolved.EffectiveUser, "password"); err != nil {
+							m.setStatus("cred: not set (or unavailable)", 3000)
+						} else {
+							// UX tweak: if a credential was just set and login mode is still manual,
+							// automatically enable askpass by persisting auth_mode=keychain in HostExtras.
+							if strings.EqualFold(strings.TrimSpace(m.effectiveLoginMode(sel.Resolved)), "manual") {
+								ex, _ := LoadHostExtras(hostKey)
+								ex.HostKey = hostKey
+								ex.AuthMode = "keychain"
+								_ = SaveHostExtras(ex)
+								m.setStatus("cred: stored in Keychain • login mode: askpass enabled", 2500)
+							} else {
+								m.setStatus("cred: stored in Keychain", 2000)
+							}
+						}
+						return m, nil
+
+					case 2:
+						// Cred delete
+						if err := CredDelete(hostKey, sel.Resolved.EffectiveUser, "password"); err != nil {
+							m.setStatus(fmt.Sprintf("cred delete failed: %v", err), 3500)
+							return m, nil
+						}
+						m.setStatus("cred: deleted from Keychain", 2000)
+						return m, nil
+
+					case 3:
+						// Logging toggle (same semantics as T key)
+						ex, _ := LoadHostExtras(hostKey)
+						ex.HostKey = hostKey
+						ex.Logging = !ex.Logging
+						if err := SaveHostExtras(ex); err != nil {
+							m.setStatus(fmt.Sprintf("logging toggle failed: %v", err), 3500)
+							return m, nil
+						}
+						if ex.Logging {
+							m.setStatus("logging: enabled", 2000)
+						} else {
+							m.setStatus("logging: disabled", 2000)
+						}
+						return m, nil
+
+					case 4:
+						// Install local SSH public key into remote authorized_keys (new window preferred).
+						// This is idempotent by default (ensure mode).
+						//
+						// Debug/status:
+						// - show that we are about to launch and which mode/host/user is being used
+
+						if err := m.tmuxInstallMyKey(sel.Resolved, false); err != nil {
+
+							m.setStatus(fmt.Sprintf("key install: %v", err), 5000)
+							return m, nil
+						}
+
+						// Keep the modal open so the user can re-run or inspect settings; also give a clear next-step hint.
+						m.setStatus("Key install started in a new tmux window (look for output there).", 4500)
+						return m, nil
+					}
+				}
+				return m, nil
+			default:
+				return m, nil
+			}
+		}
+
+		// Dashboards browser: modal navigation and materialize
+		if m.showDashBrowser {
+			switch msg.String() {
+			case "esc", "q":
+				m.showDashBrowser = false
+				m.pendingG = false
+				m.input.Blur()
+				m.recomputeFilter()
+				return m, tea.ClearScreen
+			case "j", "down":
+				// Move within merged dashboards list (YAML + recorded).
+				n := 0
+				if m.cfg != nil {
+					n += len(m.cfg.Dashboards)
+				}
+				if m.state != nil {
+					n += len(m.state.RecordedDashboards)
+				}
+				if m.dashSelected+1 < n {
+					m.dashSelected++
+				}
+				return m, nil
+			case "k", "up":
+				if m.dashSelected > 0 {
+					m.dashSelected--
+				}
+				return m, nil
+			case "l":
+				// Cycle layout override: default -> tiled -> even-h -> even-v -> main-v -> main-h -> default
+				m.dashLayoutMode = (m.dashLayoutMode + 1) % 6
+				return m, nil
+			case "enter":
+				// Materialize selected dashboard (YAML + recorded dashboards from state).
+				// Must work even if config isn't loaded (recorded dashboards can still be shown).
+				allDash := make([]Dashboard, 0, 8)
+				if m.cfg != nil && len(m.cfg.Dashboards) > 0 {
+					allDash = append(allDash, m.cfg.Dashboards...)
+				}
+				if m.state != nil && len(m.state.RecordedDashboards) > 0 {
+					for _, rdd := range m.state.RecordedDashboards {
+						allDash = append(allDash, rdd.ToConfigDashboard())
+					}
+				}
+
+				if m.dashSelected < 0 || m.dashSelected >= len(allDash) {
+					m.setStatus("No dashboard selected", 1500)
+					m.showDashBrowser = false
+					m.pendingG = false
+					m.input.Blur()
+					m.recomputeFilter()
+					return m, tea.ClearScreen
+				}
+
+				if m.cfg == nil {
+					m.setStatus("Dashboards require a loaded config (hosts/groups) to resolve panes", 3500)
+					m.showDashBrowser = false
+					m.pendingG = false
+					m.input.Blur()
+					m.recomputeFilter()
+					return m, tea.ClearScreen
+				}
+
+				// Optional enhanced path: export dashboard as a tmux-session-manager spec (YAML/JSON) and apply it
+				// via tmux-session-manager in a new tmux window.
+				//
+				// This is intentionally optional (no hard dependency): we write a spec file under
+				// ~/.config/tmux-ssh-manager/dashboards and delegate materialization to tmux-session-manager
+				// when enabled.
+				//
+				// Enable by setting:
+				//   - TMUX_SSH_MANAGER_USE_SESSION_MANAGER=1
+				//
+				// Optional knobs:
+				//   - TMUX_SSH_MANAGER_DASH_SPEC_FORMAT=yaml|json              (default: yaml)
+				//   - TMUX_SSH_MANAGER_DASH_SPEC_DIR=...                       (default: ~/.config/tmux-ssh-manager/dashboards)
+				//   - TMUX_SSH_MANAGER_DASH_DETERMINISTIC_SPLITS=1             (default: on)
+				//
+				// If anything fails, fall back to the built-in dashboard materializer below.
+				useSessionMgr := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_USE_SESSION_MANAGER")) != ""
+				if useSessionMgr {
+					d := allDash[m.dashSelected]
+					rd, rerr := m.cfg.ResolveDashboard(d)
+					if rerr == nil {
+						cfgDir, derr := DefaultConfigDir()
+						if derr == nil {
+							outDir := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_DASH_SPEC_DIR"))
+							if outDir == "" {
+								outDir = filepath.Join(cfgDir, "dashboards")
+							}
+
+							format := strings.ToLower(strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_DASH_SPEC_FORMAT")))
+							if format != "json" {
+								format = "yaml"
+							}
+
+							deterministic := true
+							if strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_DASH_DETERMINISTIC_SPLITS")) == "0" {
+								deterministic = false
+							}
+
+							apply := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_DASH_APPLY"))
+							if apply == "" {
+								apply = "1"
+							}
+
+							// Build a manager-agnostic export payload from resolved dashboard data.
+							exp := sessionfmt.DashboardExport{
+								Name:        strings.TrimSpace(d.Name),
+								Description: strings.TrimSpace(d.Description),
+								Layout:      strings.TrimSpace(d.Layout),
+								Panes:       make([]sessionfmt.DashboardPane, 0, len(rd.Panes)),
+							}
+							for _, rp := range rd.Panes {
+								hostKey := strings.TrimSpace(rp.Target.Host.Name)
+								cmds := make([]string, 0, len(rp.EffectiveCommands))
+								for _, c := range rp.EffectiveCommands {
+									c = strings.TrimSpace(c)
+									if c != "" {
+										cmds = append(cmds, c)
+									}
+								}
+								exp.Panes = append(exp.Panes, sessionfmt.DashboardPane{
+									Title:    strings.TrimSpace(rp.Pane.Title),
+									Host:     hostKey,
+									Commands: cmds,
+									Env:      nil,
+								})
+							}
+
+							_ = os.MkdirAll(outDir, 0o700)
+							outPath, pathErr := sessionfmt.SuggestedDashboardSpecPath(outDir, d.Name, sessionfmt.OutputFormat(format))
+							if pathErr != nil {
+								// Best-effort: fall back to a simple filename in outDir.
+								outPath = filepath.Join(outDir, "dashboard.tmux-session."+format)
+							}
+
+							wopt := sessionfmt.WriterOptions{
+								SessionName:    "", // let exporter derive
+								ExportName:     exp.Name,
+								Description:    exp.Description,
+								Root:           outDir, // treat export dir as a "project root" for apply
+								PreferPanePlan: deterministic,
+								Layout:         exp.Layout,
+								WindowName:     "dashboard",
+								PaneTitles:     true,
+								ShellProgram:   "bash",
+								ShellFlag:      "-lc",
+								Now:            time.Now,
+								Attach:         boolPtr(true),
+								SwitchClient:   boolPtr(true),
+								BaseIndex:      nil,
+								PaneBaseIndex:  nil,
+							}
+
+							// Write the exported spec file.
+							if werr := sessionfmt.WriteDashboardSpec(outPath, sessionfmt.OutputFormat(format), exp, wopt); werr == nil {
+								// Apply via tmux-session-manager if enabled.
+								if apply != "0" {
+									bin := strings.TrimSpace(os.Getenv("TMUX_SESSION_MANAGER_BIN"))
+									if bin == "" {
+										bin = "tmux-session-manager"
+									}
+
+									// tmux-session-manager expects project-local spec detection, so we:
+									// 1) ensure a ".tmux-session.yaml/.json" exists in outDir
+									// 2) run tmux-session-manager with roots=outDir, query selecting this exported dashboard
+									// This uses session-manager’s engine (pane_plan, policy enforcement, etc.).
+									projectSpecPath := filepath.Join(outDir, ".tmux-session."+format)
+									_ = os.WriteFile(projectSpecPath, []byte{}, 0o600) // placeholder to ensure path exists
+									_ = os.Rename(outPath, projectSpecPath)
+
+									// Launch session-manager to apply the spec in a new tmux window (consistent UX).
+									// Note: allow-shell/passthrough are not enabled here; exported specs are safe by default.
+									_ = exec.Command(
+										"tmux",
+										"new-window",
+										"-n", "dash-apply",
+										"-c", "#{pane_current_path}",
+										"--",
+										"bash",
+										"-lc",
+										fmt.Sprintf("%s --roots %q --prefer-project-spec --query %q", shellEscapeForSh(bin), outDir, filepath.Base(outDir)),
+									).Run()
+
+									m.setStatus(fmt.Sprintf("dashboard applied via tmux-session-manager: %s", exp.Name), 2500)
+									m.showDashBrowser = false
+									m.pendingG = false
+									m.input.Blur()
+									m.recomputeFilter()
+									return m, tea.ClearScreen
+								}
+
+								_ = exec.Command("tmux", "display-message", "-d", "2000", fmt.Sprintf("dashboard exported: %s", outPath)).Run()
+							}
+						}
+					}
+				}
+
+				d := allDash[m.dashSelected]
+				rd, err := m.cfg.ResolveDashboard(d)
+				if err != nil {
+					m.setStatus(fmt.Sprintf("dashboard error: %v", err), 3000)
+					return m, nil
+				}
+				// Create window or use current
+				//
+				// IMPORTANT:
+				// Dashboards are currently materialized within a single tmux window (splits only).
+				// For recording/replay/export to be meaningful and non-destructive, we default to
+				// creating a NEW window unless the dashboard explicitly opted out.
+				//
+				// This ensures:
+				// - "save layout" is meaningful (you can always return to your original window)
+				// - "windows" semantics in exported specs remain coherent even though we only
+				//   support h/v splits here (no multi-window dashboard plan yet).
+				var windowID string
+				createNewWindow := d.NewWindow
+				if !createNewWindow {
+					// Default-on safety: avoid mutating the user's current working window when applying dashboards.
+					createNewWindow = true
+				}
+
+				if createNewWindow {
+					out, e := exec.Command("tmux", "new-window", "-P", "-F", "#{window_id}", "-c", "#{pane_current_path}").Output()
+					if e != nil {
+						m.setStatus(fmt.Sprintf("new-window error: %v", e), 3000)
+						return m, nil
+					}
+					windowID = strings.TrimSpace(string(out))
+					if windowID != "" {
+						m.createdWindowIDs = append(m.createdWindowIDs, windowID)
+					}
+				} else {
+					// Use current window id
+					out, e := exec.Command("tmux", "display-message", "-p", "#{window_id}").Output()
+					if e == nil {
+						windowID = strings.TrimSpace(string(out))
+					}
+				}
+
+				// Ensure at least one pane exists; get initial pane_id
+				var paneIDs []string
+				if windowID != "" {
+					out, e := exec.Command("tmux", "list-panes", "-t", windowID, "-F", "#{pane_id}").Output()
+					if e == nil {
+						lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+						for _, ln := range lines {
+							p := strings.TrimSpace(ln)
+							if p != "" {
+								paneIDs = append(paneIDs, p)
+							}
+						}
+					}
+				}
+
+				// Create required panes
+				for i := 1; i < len(rd.Panes); i++ {
+					// Alternate splits for simplicity
+					splitArg := "-h"
+					if i%2 == 1 {
+						splitArg = "-v"
+					}
+					out, e := exec.Command("tmux", "split-window", splitArg, "-P", "-F", "#{pane_id}", "-c", "#{pane_current_path}").Output()
+					if e != nil {
+						m.setStatus(fmt.Sprintf("split error: %v", e), 3000)
+						return m, nil
+					}
+					pid := strings.TrimSpace(string(out))
+					if pid != "" {
+						m.createdPaneIDs = append(m.createdPaneIDs, pid)
+						paneIDs = append(paneIDs, pid)
+					}
+				}
+
+				// Apply layout (either override or dashboard-provided layout).
+				// Recorded dashboards may include a captured tmux layout string (#{window_layout}),
+				// stored in d.Layout via RecordedDashboard.ToConfigDashboard().
+				if windowID != "" {
+					override := ""
+					switch m.dashLayoutMode {
+					case 1:
+						override = "tiled"
+					case 2:
+						override = "even-horizontal"
+					case 3:
+						override = "even-vertical"
+					case 4:
+						override = "main-vertical"
+					case 5:
+						override = "main-horizontal"
+					}
+					if override != "" {
+						_ = exec.Command("tmux", "select-layout", "-t", windowID, override).Run()
+					} else if strings.TrimSpace(d.Layout) != "" {
+						_ = exec.Command("tmux", "select-layout", "-t", windowID, strings.TrimSpace(d.Layout)).Run()
+					}
+				}
+
+				// Populate panes: run SSH and send commands
+				for i, rp := range rd.Panes {
+					var targetPane string
+					if i < len(paneIDs) {
+						targetPane = paneIDs[i]
+					} else {
+						// fallback: current pane
+						out, e := exec.Command("tmux", "display-message", "-p", "#{pane_id}").Output()
+						if e == nil {
+							targetPane = strings.TrimSpace(string(out))
+						}
+					}
+					// Enable per-host daily logging for this pane (before starting SSH),
+					// so all SSH output is captured without breaking the TTY.
+					_ = enableTmuxPipePaneLoggingForTarget(targetPane, rp.Target.Host.Name)
+
+					// In target pane, run SSH
+					//
+					// IMPORTANT:
+					// - Users may alias `ssh` -> `tmux-ssh-manager ssh` (or other functions), which can cause recursion if we
+					//   execute a plain `ssh ...` shell line.
+					// - We also want tmux-ssh-manager's askpass/keychain behavior when login_mode=askpass.
+					//
+					// Therefore, prefer invoking tmux-ssh-manager's public ssh wrapper explicitly.
+					// It will decide whether to use __connect (PTY + Keychain) or fall back to system ssh.
+					bin := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_BIN"))
+					if bin == "" {
+						bin = "tmux-ssh-manager"
+					}
+					hostKey := strings.TrimSpace(rp.Target.Host.Name)
+					userArg := strings.TrimSpace(rp.Target.EffectiveUser)
+					userFlag := ""
+					if userArg != "" {
+						userFlag = " --user " + shellEscapeForSh(userArg)
+					}
+
+					// Run the wrapper in tmux mode so it behaves like the rest of the TUI workflows.
+					wrapperLine := shellEscapeForSh(bin) + " ssh --tmux --host " + shellEscapeForSh(hostKey) + userFlag
+					_ = exec.Command("tmux", "send-keys", "-t", targetPane, "--", "bash -lc "+shellQuoteCmdSimple([]string{wrapperLine}), "Enter").Run()
+					// Delay after starting SSH before sending on_connect/pane commands.
+					// Use per-pane delay if configured; otherwise default to 500ms.
+					delayMS := rp.EffectiveConnectDelayMS
+					if delayMS <= 0 {
+						delayMS = 500
+					}
+					time.Sleep(time.Duration(delayMS) * time.Millisecond)
+
+					// Send pane-level commands (EffectiveOnConnect + pane.Commands already merged)
+					// and log them with copy/paste-friendly markers.
+					m.sendRecorded(rp.Target.Host.Name, targetPane, rp.EffectiveCommands)
+				}
+
+				// If opened in a new window, provide quick navigation hints without requiring ":" commands.
+				if createNewWindow && windowID != "" {
+					_ = exec.Command("tmux", "display-message", "-d", "3500", "Dashboard window created. Switch with: n/p (next/prev) or choose-window (prefix+w).").Run()
+				}
+
+				m.setStatus(fmt.Sprintf("Materialized dashboard: %s", d.Name), 2000)
+				m.showDashBrowser = false
+				m.pendingG = false
+				m.input.Blur()
+				m.recomputeFilter()
+				return m, tea.ClearScreen
+			default:
+				// ignore other keys in dashboard mode
+				return m, nil
+			}
+		}
+		// Help overlay: most keys exit help
+		if m.showHelp {
+			switch msg.String() {
+			case "?", "esc", "enter", "q":
+				m.showHelp = false
+				m.pendingG = false
+				m.input.Blur()
+				m.recomputeFilter()
+				return m, tea.ClearScreen
+			default:
+				m.showHelp = false
+				// fallthrough and handle normally
+			}
+		}
+
+		// ":" command bar has priority (SecureCRT-like)
+		if m.showCmdline && m.cmdline.Focused() {
+			switch msg.String() {
+			case "esc":
+				m.showCmdline = false
+				m.cmdline.SetValue("")
+				m.cmdline.Blur()
+				m.cmdSuggestIdx = -1
+				m.pendingG = false
+				return m, tea.ClearScreen
+
+			case "tab":
+				// Simple completion:
+				// - If there's an unambiguous first suggestion, fill it.
+				// - Otherwise cycle through up to 10 suggestions.
+				if m.cmdCandidates == nil {
+					m.cmdCandidates = m.buildCmdCandidates()
+				}
+				cur := m.cmdline.Value()
+				sugs := m.cmdSuggestions(cur)
+				if len(sugs) == 0 {
+					return m, nil
+				}
+				m.cmdSuggestIdx++
+				if m.cmdSuggestIdx >= len(sugs) {
+					m.cmdSuggestIdx = 0
+				}
+				m.cmdline.SetValue(sugs[m.cmdSuggestIdx])
+				return m, nil
+
+			case "enter":
+				raw := strings.TrimSpace(m.cmdline.Value())
+				m.showCmdline = false
+				m.cmdline.SetValue("")
+				m.cmdline.Blur()
+				m.cmdSuggestIdx = -1
+				m.pendingG = false
+
+				// Parse: first token + remainder.
+				fields := strings.Fields(raw)
+				cmd := ""
+				rest := ""
+				if len(fields) > 0 {
+					cmd = strings.ToLower(fields[0])
+					if len(fields) > 1 {
+						rest = strings.TrimSpace(raw[len(fields[0]):])
+					}
+				}
+
+				// Helpers
+				openDashBrowser := func() {
+					m.input.Blur()
+					m.showDashBrowser = true
+					if m.dashSelected < 0 {
+						m.dashSelected = 0
+					}
+				}
+				setQuery := func(q string) {
+					m.input.SetValue(strings.TrimSpace(q))
+					m.recomputeFilter()
+				}
+
+				switch cmd {
+				case "", "menu":
+					// Full reference lives here (footer is intentionally minimal).
+					m.setStatus(
+						"Navigation: j/k move • gg/G top/bot • u/d half-page • H/L group • n/N next/prev match\n"+
+							"Search: / forward • ? backward • type to search • Esc blur • :search <q>\n"+
+							"Connect: Enter/c connect • v split • s split • w window • W windows (all selected)\n"+
+							"Selection: Space toggle-select • f favorite • F favorites • R recents • A all\n"+
+							"Dashboards: B browser • :dash [name] • l layout override (in dashboards)\n"+
+							"Commands: :send <cmd> • :sendall <cmd> • :watch [interval_s] <cmd> • :watchall [interval_s] <cmd>\n"+
+							"Save: Ctrl+s save current window as a recorded dashboard\n"+
+							"Recorder: :record start <name> [desc...] • :record stop • :record save [name] • :record delete <name> • :record status\n"+
+							"Host: S settings • :login manual|askpass|status • :cred status|set|delete\n"+
+							"Logs: l viewer • O pager • T toggle logging policy • :logs • :log toggle|on|off\n"+
+							"Other: y yank • Y yank-all • :run <macro> [split v|split h|window|connect] • q quit\n"+
+							"tmux: prefix+w choose-window • prefix+n/p next/prev",
+						12000,
+					)
+					return m, tea.ClearScreen
+
+				case "h", "help":
+					m.showHelp = true
+					return m, tea.ClearScreen
+
+				case "q", "quit", "exit":
+					m.quitting = true
+					return m.quit()
+
+				case "search", "/":
+					m.searchForward = true
+					setQuery(rest)
+					m.input.Focus()
+					return m, tea.ClearScreen
+
+				case "?":
+					m.searchForward = false
+					setQuery(rest)
+					m.input.Focus()
+					return m, tea.ClearScreen
+
+				case "clear":
+					setQuery("")
+					return m, tea.ClearScreen
+
+				case "all":
+					m.filterFavorites = false
+					m.filterRecents = false
+					m.recomputeFilter()
+					return m, tea.ClearScreen
+
+				case "fav", "favorites":
+					m.filterFavorites = !m.filterFavorites
+					m.filterRecents = false
+					m.recomputeFilter()
+					return m, tea.ClearScreen
+
+				case "recent", "recents":
+					m.filterRecents = !m.filterRecents
+					m.filterFavorites = false
+					m.recomputeFilter()
+					return m, tea.ClearScreen
+
+				case "dashsave":
+					// backward-compat alias for `:dash save ...`
+					cmd = "dash"
+					rest = "save " + strings.TrimSpace(rest)
+					// fallthrough to dash handler below
+					fallthrough
+
+				case "watch":
+					// :watch [interval_s] <command...>
+					// Sugar over :send that wraps the command in `watch -n <interval> -t -- <cmd>`.
+					args := strings.Fields(strings.TrimSpace(rest))
+					if len(args) == 0 {
+						m.setStatus("Usage: :watch [interval_s] <command>", 3500)
+						return m, tea.ClearScreen
+					}
+					interval := 2
+					restCmd := strings.TrimSpace(rest)
+					if n, err := strconv.Atoi(args[0]); err == nil && n > 0 {
+						interval = n
+						restCmd = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(rest), args[0]))
+					}
+					if strings.TrimSpace(restCmd) == "" {
+						m.setStatus("Usage: :watch [interval_s] <command>", 3500)
+						return m, tea.ClearScreen
+					}
+					wrapped := fmt.Sprintf("watch -n %d -t -- %s", interval, strings.TrimSpace(restCmd))
+
+					// Reuse :send implementation (inline, kept explicit for clarity).
+					// Resolve target pane: prefer current pane, else last created pane.
+					paneID := ""
+					if out, e := exec.Command("tmux", "display-message", "-p", "#{pane_id}").Output(); e == nil {
+						paneID = strings.TrimSpace(string(out))
+					}
+					if paneID == "" && len(m.createdPaneIDs) > 0 {
+						paneID = strings.TrimSpace(m.createdPaneIDs[len(m.createdPaneIDs)-1])
+					}
+					if paneID == "" {
+						m.setStatus("watch: could not resolve a tmux pane id", 3500)
+						return m, tea.ClearScreen
+					}
+					hostKey := ""
+					if m.paneHost != nil {
+						hostKey = strings.TrimSpace(m.paneHost[paneID])
+					}
+					if hostKey == "" {
+						// fallback: if current selection exists, attribute to it
+						if sel := m.current(); sel != nil {
+							hostKey = strings.TrimSpace(sel.Resolved.Host.Name)
+						}
+					}
+					if hostKey == "" {
+						m.setStatus("watch: unknown host for target pane (open via tmux-ssh-manager first)", 4500)
+						return m, tea.ClearScreen
+					}
+					m.sendRecorded(hostKey, paneID, []string{wrapped})
+					m.setStatus(fmt.Sprintf("watch every %ds: sent + recorded", interval), 2000)
+					return m, tea.ClearScreen
+
+				case "watchall":
+					// :watchall [interval_s] <command...>
+					// Sugar over :sendall that wraps the command in `watch -n <interval> -t -- <cmd>`.
+					args := strings.Fields(strings.TrimSpace(rest))
+					if len(args) == 0 {
+						m.setStatus("Usage: :watchall [interval_s] <command>", 3500)
+						return m, tea.ClearScreen
+					}
+					interval := 2
+					restCmd := strings.TrimSpace(rest)
+					if n, err := strconv.Atoi(args[0]); err == nil && n > 0 {
+						interval = n
+						restCmd = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(rest), args[0]))
+					}
+					if strings.TrimSpace(restCmd) == "" {
+						m.setStatus("Usage: :watchall [interval_s] <command>", 3500)
+						return m, tea.ClearScreen
+					}
+					wrapped := fmt.Sprintf("watch -n %d -t -- %s", interval, strings.TrimSpace(restCmd))
+
+					if len(m.createdPaneIDs) == 0 {
+						m.setStatus("watchall: no panes tracked (use v/s/w/W or dashboards first)", 3500)
+						return m, tea.ClearScreen
+					}
+					sent := 0
+					for _, pid := range m.createdPaneIDs {
+						pid = strings.TrimSpace(pid)
+						if pid == "" {
+							continue
+						}
+						hostKey := ""
+						if m.paneHost != nil {
+							hostKey = strings.TrimSpace(m.paneHost[pid])
+						}
+						if hostKey == "" {
+							continue
+						}
+						m.sendRecorded(hostKey, pid, []string{wrapped})
+						sent++
+					}
+					m.setStatus(fmt.Sprintf("watch every %ds: sent + recorded to %d pane(s)", interval, sent), 2500)
+					return m, tea.ClearScreen
+
+				case "send":
+					// :send <command...>
+					// Sends to the current tmux pane (or the most-recently created pane) and records it.
+					cmdStr := strings.TrimSpace(rest)
+					if cmdStr == "" {
+						m.setStatus("Usage: :send <command>", 3500)
+						return m, tea.ClearScreen
+					}
+					// Resolve target pane: prefer current pane, else last created pane.
+					paneID := ""
+					if out, e := exec.Command("tmux", "display-message", "-p", "#{pane_id}").Output(); e == nil {
+						paneID = strings.TrimSpace(string(out))
+					}
+					if paneID == "" && len(m.createdPaneIDs) > 0 {
+						paneID = strings.TrimSpace(m.createdPaneIDs[len(m.createdPaneIDs)-1])
+					}
+					if paneID == "" {
+						m.setStatus("send: could not resolve a tmux pane id", 3500)
+						return m, tea.ClearScreen
+					}
+					hostKey := ""
+					if m.paneHost != nil {
+						hostKey = strings.TrimSpace(m.paneHost[paneID])
+					}
+					if hostKey == "" {
+						// fallback: if current selection exists, attribute to it
+						if sel := m.current(); sel != nil {
+							hostKey = strings.TrimSpace(sel.Resolved.Host.Name)
+						}
+					}
+					if hostKey == "" {
+						m.setStatus("send: unknown host for target pane (open via tmux-ssh-manager first)", 4500)
+						return m, tea.ClearScreen
+					}
+					m.sendRecorded(hostKey, paneID, []string{cmdStr})
+					m.setStatus("sent + recorded", 1500)
+					return m, tea.ClearScreen
+
+				case "sendall":
+					// :sendall <command...>
+					// Sends to all panes created by tmux-ssh-manager (best-effort) and records per pane.
+					cmdStr := strings.TrimSpace(rest)
+					if cmdStr == "" {
+						m.setStatus("Usage: :sendall <command>", 3500)
+						return m, tea.ClearScreen
+					}
+					if len(m.createdPaneIDs) == 0 {
+						m.setStatus("sendall: no panes tracked (use v/s/w/W or dashboards first)", 3500)
+						return m, tea.ClearScreen
+					}
+					sent := 0
+					for _, pid := range m.createdPaneIDs {
+						pid = strings.TrimSpace(pid)
+						if pid == "" {
+							continue
+						}
+						hostKey := ""
+						if m.paneHost != nil {
+							hostKey = strings.TrimSpace(m.paneHost[pid])
+						}
+						if hostKey == "" {
+							continue
+						}
+						m.sendRecorded(hostKey, pid, []string{cmdStr})
+						sent++
+					}
+					m.setStatus(fmt.Sprintf("sent + recorded to %d pane(s)", sent), 2000)
+					return m, tea.ClearScreen
+
+				case "dashboards":
+					openDashBrowser()
+					return m, tea.ClearScreen
+
+				case "dash", "dashboard":
+					// :dash -> open browser
+					// :dash <name> -> open browser + preselect match
+					// :dash save <name> [desc...] -> snapshot current tmux window into a recorded dashboard
+					// :dash export <name> [yaml|json] -> export dashboard to tmux-session-manager spec (no apply)
+					// :dash apply <name> -> export + apply via tmux-session-manager (if available)
+					// :dash apply-file <path> -> apply an existing spec file via tmux-session-manager
+					// Matches both YAML dashboards and recorded dashboards (state.json).
+					name := strings.TrimSpace(rest)
+
+					// Subcommand: export dashboard to tmux-session-manager spec file
+					// Usage: :dash export <name> [yaml|json]
+					if strings.HasPrefix(strings.ToLower(name), "export ") {
+						args := strings.Fields(strings.TrimSpace(name))
+						if len(args) < 2 || strings.TrimSpace(args[1]) == "" {
+							m.setStatus("Usage: :dash export <name> [yaml|json]", 3500)
+							return m, tea.ClearScreen
+						}
+						dashName := strings.TrimSpace(args[1])
+						format := "yaml"
+						if len(args) >= 3 {
+							f := strings.ToLower(strings.TrimSpace(args[2]))
+							if f == "json" {
+								format = "json"
+							}
+						}
+
+						if m.cfg == nil {
+							m.setStatus("dash export: config not loaded (need hosts/groups to resolve panes)", 3500)
+							return m, tea.ClearScreen
+						}
+
+						// Find dashboard in config or recorded dashboards
+						var d Dashboard
+						found := false
+						if m.cfg != nil {
+							if dd := m.cfg.FindDashboard(dashName); dd != nil {
+								d = *dd
+								found = true
+							}
+						}
+						if !found && m.state != nil {
+							if rdash := m.state.FindRecordedDashboard(dashName); rdash != nil {
+								d = rdash.ToConfigDashboard()
+								found = true
+							}
+						}
+						if !found {
+							m.setStatus(fmt.Sprintf("dash export: dashboard not found: %s", dashName), 3500)
+							return m, tea.ClearScreen
+						}
+
+						resolved, rerr := m.cfg.ResolveDashboard(d)
+						if rerr != nil {
+							m.setStatus(fmt.Sprintf("dash export: resolve failed: %v", rerr), 3500)
+							return m, tea.ClearScreen
+						}
+
+						cfgDir, derr := DefaultConfigDir()
+						if derr != nil {
+							m.setStatus(fmt.Sprintf("dash export: config dir error: %v", derr), 3500)
+							return m, tea.ClearScreen
+						}
+						outDir := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_DASH_SPEC_DIR"))
+						if outDir == "" {
+							outDir = filepath.Join(cfgDir, "dashboards")
+						}
+						_ = os.MkdirAll(outDir, 0o700)
+
+						// Deterministic splits default on (pane_plan)
+						deterministic := true
+						if strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_DASH_DETERMINISTIC_SPLITS")) == "0" {
+							deterministic = false
+						}
+
+						exp := sessionfmt.DashboardExport{
+							Name:        strings.TrimSpace(d.Name),
+							Description: strings.TrimSpace(d.Description),
+							Layout:      strings.TrimSpace(d.Layout),
+							Panes:       make([]sessionfmt.DashboardPane, 0, len(resolved.Panes)),
+						}
+						for _, rp := range resolved.Panes {
+							hostKey := strings.TrimSpace(rp.Target.Host.Name)
+							cmds := make([]string, 0, len(rp.EffectiveCommands))
+							for _, c := range rp.EffectiveCommands {
+								c = strings.TrimSpace(c)
+								if c != "" {
+									cmds = append(cmds, c)
+								}
+							}
+							exp.Panes = append(exp.Panes, sessionfmt.DashboardPane{
+								Title:    strings.TrimSpace(rp.Pane.Title),
+								Host:     hostKey,
+								Commands: cmds,
+								Env:      nil,
+							})
+						}
+
+						outPath, pathErr := sessionfmt.SuggestedDashboardSpecPath(outDir, d.Name, sessionfmt.OutputFormat(format))
+						if pathErr != nil {
+							outPath = filepath.Join(outDir, "dashboard.tmux-session."+format)
+						}
+
+						wopt := sessionfmt.WriterOptions{
+							SessionName:    "",
+							ExportName:     exp.Name,
+							Description:    exp.Description,
+							Root:           outDir,
+							PreferPanePlan: deterministic,
+							Layout:         exp.Layout,
+							WindowName:     "dashboard",
+							PaneTitles:     true,
+							ShellProgram:   "bash",
+							ShellFlag:      "-lc",
+							Now:            time.Now,
+							Attach:         boolPtr(true),
+							SwitchClient:   boolPtr(true),
+						}
+
+						if werr := sessionfmt.WriteDashboardSpec(outPath, sessionfmt.OutputFormat(format), exp, wopt); werr != nil {
+							m.setStatus(fmt.Sprintf("dash export failed: %v", werr), 3500)
+							return m, tea.ClearScreen
+						}
+
+						m.setStatus(fmt.Sprintf("dashboard exported: %s", outPath), 3500)
+						return m, tea.ClearScreen
+					}
+
+					// Subcommand: apply dashboard by name via tmux-session-manager (export + apply)
+					// Usage: :dash apply <name>
+					if strings.HasPrefix(strings.ToLower(name), "apply ") {
+						args := strings.Fields(strings.TrimSpace(name))
+						if len(args) < 2 || strings.TrimSpace(args[1]) == "" {
+							m.setStatus("Usage: :dash apply <name>", 3500)
+							return m, tea.ClearScreen
+						}
+						dashName := strings.TrimSpace(args[1])
+
+						bin := strings.TrimSpace(os.Getenv("TMUX_SESSION_MANAGER_BIN"))
+						if bin == "" {
+							bin = "tmux-session-manager"
+						}
+
+						// Reuse export logic first (defaults to yaml).
+						// Then call tmux-session-manager --spec <file> --spec-session <derived>
+						if m.cfg == nil {
+							m.setStatus("dash apply: config not loaded (need hosts/groups to resolve panes)", 3500)
+							return m, tea.ClearScreen
+						}
+
+						// Find dashboard in config or recorded dashboards
+						var d Dashboard
+						found := false
+						if m.cfg != nil {
+							if dd := m.cfg.FindDashboard(dashName); dd != nil {
+								d = *dd
+								found = true
+							}
+						}
+						if !found && m.state != nil {
+							if rdash := m.state.FindRecordedDashboard(dashName); rdash != nil {
+								d = rdash.ToConfigDashboard()
+								found = true
+							}
+						}
+						if !found {
+							m.setStatus(fmt.Sprintf("dash apply: dashboard not found: %s", dashName), 3500)
+							return m, tea.ClearScreen
+						}
+
+						resolved, rerr := m.cfg.ResolveDashboard(d)
+						if rerr != nil {
+							m.setStatus(fmt.Sprintf("dash apply: resolve failed: %v", rerr), 3500)
+							return m, tea.ClearScreen
+						}
+
+						cfgDir, derr := DefaultConfigDir()
+						if derr != nil {
+							m.setStatus(fmt.Sprintf("dash apply: config dir error: %v", derr), 3500)
+							return m, tea.ClearScreen
+						}
+						outDir := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_DASH_SPEC_DIR"))
+						if outDir == "" {
+							outDir = filepath.Join(cfgDir, "dashboards")
+						}
+						_ = os.MkdirAll(outDir, 0o700)
+
+						// Deterministic splits default on (pane_plan)
+						deterministic := true
+						if strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_DASH_DETERMINISTIC_SPLITS")) == "0" {
+							deterministic = false
+						}
+
+						format := "yaml"
+						exp := sessionfmt.DashboardExport{
+							Name:        strings.TrimSpace(d.Name),
+							Description: strings.TrimSpace(d.Description),
+							Layout:      strings.TrimSpace(d.Layout),
+							Panes:       make([]sessionfmt.DashboardPane, 0, len(resolved.Panes)),
+						}
+						for _, rp := range resolved.Panes {
+							hostKey := strings.TrimSpace(rp.Target.Host.Name)
+							cmds := make([]string, 0, len(rp.EffectiveCommands))
+							for _, c := range rp.EffectiveCommands {
+								c = strings.TrimSpace(c)
+								if c != "" {
+									cmds = append(cmds, c)
+								}
+							}
+							exp.Panes = append(exp.Panes, sessionfmt.DashboardPane{
+								Title:    strings.TrimSpace(rp.Pane.Title),
+								Host:     hostKey,
+								Commands: cmds,
+								Env:      nil,
+							})
+						}
+
+						outPath, pathErr := sessionfmt.SuggestedDashboardSpecPath(outDir, d.Name, sessionfmt.OutputFormat(format))
+						if pathErr != nil {
+							outPath = filepath.Join(outDir, "dashboard.tmux-session."+format)
+						}
+
+						wopt := sessionfmt.WriterOptions{
+							SessionName:    "",
+							ExportName:     exp.Name,
+							Description:    exp.Description,
+							Root:           outDir,
+							PreferPanePlan: deterministic,
+							Layout:         exp.Layout,
+							WindowName:     "dashboard",
+							PaneTitles:     true,
+							ShellProgram:   "bash",
+							ShellFlag:      "-lc",
+							Now:            time.Now,
+							Attach:         boolPtr(true),
+							SwitchClient:   boolPtr(true),
+						}
+						if werr := sessionfmt.WriteDashboardSpec(outPath, sessionfmt.OutputFormat(format), exp, wopt); werr != nil {
+							m.setStatus(fmt.Sprintf("dash apply: export failed: %v", werr), 3500)
+							return m, tea.ClearScreen
+						}
+
+						// Apply via tmux-session-manager in a new window.
+						// Force a stable session name for dashboards.
+						specSession := "dash-" + strings.TrimSpace(sanitizeNameForSession(d.Name))
+						_ = exec.Command(
+							"tmux",
+							"new-window",
+							"-n", "dash-apply",
+							"-c", "#{pane_current_path}",
+							"--",
+							"bash",
+							"-lc",
+							fmt.Sprintf("%s --spec %q --spec-session %q", shellEscapeForSh(bin), outPath, specSession),
+						).Run()
+
+						m.setStatus(fmt.Sprintf("dashboard apply requested: %s", d.Name), 2500)
+						return m, tea.ClearScreen
+					}
+
+					// Subcommand: apply an existing spec file via tmux-session-manager
+					// Usage: :dash apply-file <path>
+					if strings.HasPrefix(strings.ToLower(name), "apply-file ") {
+						rest2 := strings.TrimSpace(name[len("apply-file "):])
+						if rest2 == "" {
+							m.setStatus("Usage: :dash apply-file <path>", 3500)
+							return m, tea.ClearScreen
+						}
+						specPath := rest2
+
+						bin := strings.TrimSpace(os.Getenv("TMUX_SESSION_MANAGER_BIN"))
+						if bin == "" {
+							bin = "tmux-session-manager"
+						}
+
+						_ = exec.Command(
+							"tmux",
+							"new-window",
+							"-n", "dash-apply",
+							"-c", "#{pane_current_path}",
+							"--",
+							"bash",
+							"-lc",
+							fmt.Sprintf("%s --spec %q", shellEscapeForSh(bin), specPath),
+						).Run()
+
+						m.setStatus(fmt.Sprintf("apply-file requested: %s", specPath), 2500)
+						return m, tea.ClearScreen
+					}
+
+					// Subcommand: save snapshot
+					if strings.HasPrefix(strings.ToLower(name), "save ") {
+						args := strings.Fields(strings.TrimSpace(name))
+						// args[0] == "save"
+						if len(args) < 2 || strings.TrimSpace(args[1]) == "" {
+							m.setStatus("Usage: :dash save <name> [description...]", 3500)
+							return m, tea.ClearScreen
+						}
+						recName := strings.TrimSpace(args[1])
+						desc := ""
+						if len(args) > 2 {
+							desc = strings.TrimSpace(strings.Join(args[2:], " "))
+						}
+
+						// Resolve current window id + layout
+						windowID := ""
+						if out, e := exec.Command("tmux", "display-message", "-p", "#{window_id}").Output(); e == nil {
+							windowID = strings.TrimSpace(string(out))
+						}
+						if windowID == "" {
+							m.setStatus("dash save: could not resolve tmux window id", 3500)
+							return m, tea.ClearScreen
+						}
+
+						layout := ""
+						if out, e := exec.Command("tmux", "display-message", "-p", "-t", windowID, "#{window_layout}").Output(); e == nil {
+							layout = strings.TrimSpace(string(out))
+						}
+
+						// Snapshot panes in this window. We only include panes we can map to a host.
+						panesOut, e := exec.Command("tmux", "list-panes", "-t", windowID, "-F", "#{pane_id}").Output()
+						if e != nil {
+							m.setStatus(fmt.Sprintf("dash save: list-panes failed: %v", e), 3500)
+							return m, tea.ClearScreen
+						}
+						lines := strings.Split(strings.TrimSpace(string(panesOut)), "\n")
+
+						panes := make([]RecordedPane, 0, len(lines))
+						seenHost := map[string]struct{}{}
+
+						for _, ln := range lines {
+							pid := strings.TrimSpace(ln)
+							if pid == "" {
+								continue
+							}
+
+							hostKey := ""
+							if m.paneHost != nil {
+								hostKey = strings.TrimSpace(m.paneHost[pid])
+							}
+							// If we can't map this pane to a host, skip it (it wasn't created/managed by us).
+							if hostKey == "" {
+								continue
+							}
+
+							seenHost[hostKey] = struct{}{}
+
+							// Pull any recorded commands for this pane (best-effort). If none, empty.
+							cmds := []string(nil)
+							if m.recordedPanes != nil {
+								if rp := m.recordedPanes[pid]; rp != nil && len(rp.Commands) > 0 {
+									cmds = append([]string(nil), rp.Commands...)
+								}
+							}
+
+							panes = append(panes, RecordedPane{
+								Title:    "",
+								Host:     hostKey,
+								Commands: cmds,
+							})
+						}
+
+						if len(panes) == 0 {
+							m.setStatus("dash save: no managed panes with known hosts in this window (open via tmux-ssh-manager first)", 5000)
+							return m, tea.ClearScreen
+						}
+
+						if m.state == nil {
+							m.state = &State{Version: 1}
+						}
+						rd := RecordedDashboard{
+							Name:        recName,
+							Description: desc,
+							Layout:      layout,
+							Panes:       panes,
+						}
+						_ = m.state.UpsertRecordedDashboard(rd)
+						m.saveState()
+
+						// Optional enhancement: also export a tmux-session-manager spec for this dashboard save.
+						// This is best-effort and does not affect the existing JSON state save.
+						//
+						// Enable with:
+						//   TMUX_SSH_MANAGER_EXPORT_DASHBOARD_SPEC=1
+						//
+						// Optional knobs:
+						//   TMUX_SSH_MANAGER_DASH_SPEC_FORMAT=yaml|json
+						//   TMUX_SSH_MANAGER_DASH_SPEC_DIR=...
+						//   TMUX_SSH_MANAGER_DASH_DETERMINISTIC_SPLITS=1
+						if strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_EXPORT_DASHBOARD_SPEC")) != "" {
+							cfgDir, derr := DefaultConfigDir()
+							if derr == nil {
+								outDir := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_DASH_SPEC_DIR"))
+								if outDir == "" {
+									outDir = filepath.Join(cfgDir, "dashboards")
+								}
+
+								format := strings.ToLower(strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_DASH_SPEC_FORMAT")))
+								if format != "json" {
+									format = "yaml"
+								}
+
+								deterministic := true
+								if strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_DASH_DETERMINISTIC_SPLITS")) == "0" {
+									deterministic = false
+								}
+
+								// Convert recorded dashboard back to a config dashboard for export, then resolve.
+								cd := rd.ToConfigDashboard()
+								resolved, rerr := m.cfg.ResolveDashboard(cd)
+								if rerr == nil {
+									exp := sessionfmt.DashboardExport{
+										Name:        strings.TrimSpace(cd.Name),
+										Description: strings.TrimSpace(cd.Description),
+										Layout:      strings.TrimSpace(cd.Layout),
+										Panes:       make([]sessionfmt.DashboardPane, 0, len(resolved.Panes)),
+									}
+									for _, rp := range resolved.Panes {
+										hostKey := strings.TrimSpace(rp.Target.Host.Name)
+										cmds := make([]string, 0, len(rp.EffectiveCommands))
+										for _, c := range rp.EffectiveCommands {
+											c = strings.TrimSpace(c)
+											if c != "" {
+												cmds = append(cmds, c)
+											}
+										}
+										exp.Panes = append(exp.Panes, sessionfmt.DashboardPane{
+											Title:    strings.TrimSpace(rp.Pane.Title),
+											Host:     hostKey,
+											Commands: cmds,
+											Env:      nil,
+										})
+									}
+
+									_ = os.MkdirAll(outDir, 0o700)
+									outPath, pathErr := sessionfmt.SuggestedDashboardSpecPath(outDir, cd.Name, sessionfmt.OutputFormat(format))
+									if pathErr != nil {
+										// Best-effort: fall back to a simple filename in outDir.
+										outPath = filepath.Join(outDir, "dashboard.tmux-session."+format)
+									}
+
+									wopt := sessionfmt.WriterOptions{
+										SessionName:    "",
+										ExportName:     exp.Name,
+										Description:    exp.Description,
+										Root:           "",
+										PreferPanePlan: deterministic,
+										Layout:         exp.Layout,
+										WindowName:     "dashboard",
+										PaneTitles:     true,
+										ShellProgram:   "bash",
+										ShellFlag:      "-lc",
+										Now:            time.Now,
+										Attach:         boolPtr(true),
+										SwitchClient:   boolPtr(true),
+									}
+									_ = sessionfmt.WriteDashboardSpec(outPath, sessionfmt.OutputFormat(format), exp, wopt)
+								}
+							}
+						}
+
+						if layout != "" {
+							m.setStatus(fmt.Sprintf("dashboard saved: %s (layout captured, %d pane(s))", recName, len(panes)), 4000)
+						} else {
+							m.setStatus(fmt.Sprintf("dashboard saved: %s (%d pane(s))", recName, len(panes)), 3500)
+						}
+						return m, tea.ClearScreen
+					}
+
+					// Normal behavior: open browser (and optional preselect)
+					openDashBrowser()
+					if name != "" {
+						allDash := make([]Dashboard, 0, len(m.cfg.Dashboards)+8)
+						if m.cfg != nil && len(m.cfg.Dashboards) > 0 {
+							allDash = append(allDash, m.cfg.Dashboards...)
+						}
+						if m.state != nil && len(m.state.RecordedDashboards) > 0 {
+							for _, rdd := range m.state.RecordedDashboards {
+								allDash = append(allDash, rdd.ToConfigDashboard())
+							}
+						}
+						for i := range allDash {
+							if strings.EqualFold(allDash[i].Name, name) {
+								m.dashSelected = i
+								break
+							}
+						}
+					}
+					return m, tea.ClearScreen
+
+				case "connect", "c":
+					// Reuse Enter/c behavior by directly invoking the same logic:
+					// create window(s) for selected/current then quit.
+					targets := m.currentOrSelectedResolved()
+					if len(targets) == 0 {
+						m.setStatus("No target selected", 1500)
+						return m, tea.ClearScreen
+					}
+					failed := 0
+					for _, r := range targets {
+						if _, err := m.tmuxNewWindow(r); err != nil {
+							if _, serr := m.tmuxSplitV(r); serr != nil {
+								failed++
+								continue
+							}
+						}
+						m.addRecent(r.Host.Name)
+					}
+					if failed > 0 {
+						m.setStatus(fmt.Sprintf("Opened %d, %d failed", len(targets)-failed, failed), 2500)
+					}
+					m.saveState()
+					return m.quit()
+
+				case "split":
+					// :split v|h
+					arg := strings.ToLower(strings.TrimSpace(rest))
+					targets := m.currentOrSelectedResolved()
+					if len(targets) == 0 {
+						m.setStatus("No target selected", 1500)
+						return m, tea.ClearScreen
+					}
+					failed := 0
+					switch arg {
+					case "v":
+						for _, r := range targets {
+							if _, err := m.tmuxSplitH(r); err != nil {
+								failed++
+								continue
+							}
+							m.addRecent(r.Host.Name)
+						}
+					case "h":
+						for _, r := range targets {
+							if _, err := m.tmuxSplitV(r); err != nil {
+								failed++
+								continue
+							}
+							m.addRecent(r.Host.Name)
+						}
+					default:
+						m.setStatus("Usage: :split v|h", 2500)
+						return m, tea.ClearScreen
+					}
+					if failed > 0 {
+						m.setStatus(fmt.Sprintf("Opened %d, %d failed", len(targets)-failed, failed), 2500)
+					}
+					m.saveState()
+					return m.quit()
+
+				case "window", "w":
+					// Alias to "connect in new window(s)"
+					targets := m.currentOrSelectedResolved()
+					if len(targets) == 0 {
+						m.setStatus("No target selected", 1500)
+						return m, tea.ClearScreen
+					}
+					failed := 0
+					for _, r := range targets {
+						if _, err := m.tmuxNewWindow(r); err != nil {
+							failed++
+							continue
+						}
+						m.addRecent(r.Host.Name)
+					}
+					if failed > 0 {
+						m.setStatus(fmt.Sprintf("Opened %d, %d failed", len(targets)-failed, failed), 2500)
+					}
+					m.saveState()
+					return m.quit()
+
+				case "windows":
+					// Can't intercept keys once you're inside SSH; point to tmux-native chooser.
+					m.setStatus("Window switching: use tmux prefix+w (choose-window), prefix+n/p next/prev", 4500)
+					return m, tea.ClearScreen
+
+				case "logs":
+					if sel := m.current(); sel != nil {
+						m.pendingG = false
+						if err := m.openLogs(sel.Resolved.Host.Name); err != nil {
+							m.setStatus(fmt.Sprintf("logs: %v", err), 3500)
+							return m, tea.ClearScreen
+						}
+						m.showLogs = true
+						return m, tea.ClearScreen
+					}
+					m.setStatus("No current host for logs", 1500)
+					return m, tea.ClearScreen
+
+				case "cred":
+					// cred status|set|delete (macOS Keychain)
+					sub := strings.ToLower(strings.TrimSpace(rest))
+					switch sub {
+					case "status", "test":
+						if sel := m.current(); sel != nil {
+							hostKey := strings.TrimSpace(sel.Resolved.Host.Name)
+							loginMode := strings.ToLower(strings.TrimSpace(m.effectiveLoginMode(sel.Resolved)))
+
+							// Password auth only for now; account defaults to hostKey when user is empty.
+							if err := CredGet(hostKey, sel.Resolved.EffectiveUser, "password"); err != nil {
+								if loginMode == "askpass" {
+									m.setStatus(fmt.Sprintf("cred: MISSING for %s (login_mode=askpass). Run :cred set", hostKey), 4500)
+								} else {
+									m.setStatus(fmt.Sprintf("cred: missing/unavailable for %s (login_mode=%s)", hostKey, loginMode), 3000)
+								}
+							} else {
+								m.setStatus(fmt.Sprintf("cred: available for %s (login_mode=%s)", hostKey, loginMode), 2500)
+							}
+							return m, tea.ClearScreen
+						}
+						m.setStatus("cred: no current host", 1500)
+						return m, tea.ClearScreen
+
+					case "set":
+						if sel := m.current(); sel != nil {
+							hostKey := strings.TrimSpace(sel.Resolved.Host.Name)
+							if hostKey == "" {
+								m.setStatus("cred: no current host", 1500)
+								return m, tea.ClearScreen
+							}
+
+							userArg := strings.TrimSpace(sel.Resolved.EffectiveUser)
+							bin := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_BIN"))
+							if bin == "" {
+								bin = "tmux-ssh-manager"
+							}
+
+							userFlag := ""
+							if userArg != "" {
+								userFlag = "--user " + shellEscapeForSh(userArg)
+							}
+
+							// Prefer a foreground popup. -E closes automatically on success.
+							popupCmd := fmt.Sprintf(
+								"printf '\\033[?25h\\033[0m' >/dev/tty 2>/dev/null || true; stty sane </dev/tty >/dev/tty 2>/dev/null || true; %s cred set --host %s %s; rc=$?; echo; if [ $rc -eq 0 ]; then echo 'Saved to Keychain.'; exit 0; else echo 'FAILED (exit='$rc')'; echo; echo 'Press Enter to close...'; read -r _; exit $rc; fi",
+								shellEscapeForSh(bin),
+								shellEscapeForSh(hostKey),
+								userFlag,
+							)
+
+							popupErr := exec.Command(
+								"tmux", "display-popup",
+								"-E",
+								"-T", fmt.Sprintf("tmux-ssh-manager: credential for %s", hostKey),
+								"-w", "80%",
+								"-h", "60%",
+								"--",
+								"bash", "-lc", popupCmd,
+							).Run()
+
+							if popupErr != nil {
+								// Fallback: open a window for credential prompting; keep it open until the user confirms.
+								_ = exec.Command(
+									"tmux", "new-window",
+									"-n", "cred-set",
+									"bash", "-lc",
+									fmt.Sprintf(
+										"printf '\\033[?25h\\033[0m' >/dev/tty 2>/dev/null || true; stty sane </dev/tty >/dev/tty 2>/dev/null || true; %s cred set --host %s %s; rc=$?; echo; if [ $rc -eq 0 ]; then echo 'Saved to Keychain.'; else echo 'FAILED (exit='$rc')'; fi; echo; echo 'Press Enter to close...'; read -r _",
+										shellEscapeForSh(bin),
+										shellEscapeForSh(hostKey),
+										userFlag,
+									),
+								).Run()
+							}
+
+							// Refresh status (non-revealing)
+							if err := CredGet(hostKey, sel.Resolved.EffectiveUser, "password"); err != nil {
+								m.setStatus("cred: not set (or unavailable)", 3000)
+							} else {
+								// UX tweak: if a credential was just set and login mode is still manual,
+								// automatically enable askpass by persisting auth_mode=keychain in HostExtras.
+								if strings.EqualFold(strings.TrimSpace(m.effectiveLoginMode(sel.Resolved)), "manual") {
+									ex, _ := LoadHostExtras(hostKey)
+									ex.HostKey = hostKey
+									ex.AuthMode = "keychain"
+									_ = SaveHostExtras(ex)
+									m.setStatus("cred: stored in Keychain • login mode: askpass enabled", 2500)
+								} else {
+									m.setStatus("cred: stored in Keychain", 2000)
+								}
+							}
+							return m, tea.ClearScreen
+						}
+						m.setStatus("cred: no current host", 1500)
+						return m, tea.ClearScreen
+
+					case "delete", "del", "rm":
+						if sel := m.current(); sel != nil {
+							hostKey := strings.TrimSpace(sel.Resolved.Host.Name)
+							if hostKey == "" {
+								m.setStatus("cred: no current host", 1500)
+								return m, tea.ClearScreen
+							}
+							if err := CredDelete(hostKey, sel.Resolved.EffectiveUser, "password"); err != nil {
+								m.setStatus(fmt.Sprintf("cred delete failed: %v", err), 3500)
+							} else {
+								m.setStatus("cred: deleted from Keychain", 2000)
+							}
+							return m, tea.ClearScreen
+						}
+						m.setStatus("cred: no current host", 1500)
+						return m, tea.ClearScreen
+
+					default:
+						m.setStatus("Usage: :cred status|set|delete", 2500)
+						return m, tea.ClearScreen
+					}
+
+				case "login":
+					// login manual|askpass|status (persisted via HostExtras auth_mode; no YAML rewrite)
+					arg := strings.ToLower(strings.TrimSpace(rest))
+					if sel := m.current(); sel != nil {
+						hostKey := strings.TrimSpace(sel.Resolved.Host.Name)
+						if hostKey == "" {
+							m.setStatus("login: no current host", 1500)
+							return m, tea.ClearScreen
+						}
+						ex, _ := LoadHostExtras(hostKey)
+						ex.HostKey = hostKey
+						switch arg {
+						case "", "status":
+							m.setStatus(fmt.Sprintf("login mode: %s", m.effectiveLoginMode(sel.Resolved)), 2500)
+							return m, tea.ClearScreen
+						case "askpass", "keychain":
+							ex.AuthMode = "keychain"
+						case "manual":
+							ex.AuthMode = "manual"
+						default:
+							m.setStatus("Usage: :login manual|askpass|status", 2500)
+							return m, tea.ClearScreen
+						}
+						if err := SaveHostExtras(ex); err != nil {
+							m.setStatus(fmt.Sprintf("login mode save failed: %v", err), 3500)
+							return m, tea.ClearScreen
+						}
+						m.setStatus(fmt.Sprintf("login mode: %s", m.effectiveLoginMode(sel.Resolved)), 2000)
+						return m, tea.ClearScreen
+					}
+					m.setStatus("login: no current host", 1500)
+					return m, tea.ClearScreen
+
+				case "log":
+					// log toggle|on|off (policy)
+					sub := strings.ToLower(strings.TrimSpace(rest))
+					if sel := m.current(); sel != nil {
+						hostKey := strings.TrimSpace(sel.Resolved.Host.Name)
+						ex, _ := LoadHostExtras(hostKey)
+						ex.HostKey = hostKey
+
+						switch sub {
+						case "toggle":
+							ex.Logging = !ex.Logging
+						case "on", "enable", "enabled", "true":
+							ex.Logging = true
+						case "off", "disable", "disabled", "false":
+							ex.Logging = false
+						default:
+							m.setStatus("Usage: :log toggle|on|off", 2500)
+							return m, tea.ClearScreen
+						}
+
+						if err := SaveHostExtras(ex); err != nil {
+							m.setStatus(fmt.Sprintf("Logging toggle failed: %v", err), 3500)
+							return m, tea.ClearScreen
+						}
+						if ex.Logging {
+							m.setStatus("Logging: enabled", 1500)
+						} else {
+							m.setStatus("Logging: disabled", 1500)
+						}
+						return m, tea.ClearScreen
+					}
+					m.setStatus("No current host for log policy", 1500)
+					return m, tea.ClearScreen
+
+				case "run":
+					// :run <macroName> [split v|h|window|connect]
+					// Default: window (one per target) because it's safest and least disruptive.
+					args := strings.Fields(strings.TrimSpace(rest))
+					if len(args) == 0 {
+						m.setStatus("Usage: :run <macro> [split v|h|window|connect]", 3500)
+						return m, tea.ClearScreen
+					}
+					macroName := args[0]
+					mode := "window"
+					if len(args) > 1 {
+						mode = strings.ToLower(strings.Join(args[1:], " "))
+					}
+
+					mac := m.findMacro(macroName)
+					if mac == nil {
+						m.setStatus(fmt.Sprintf("Unknown macro: %s", macroName), 3500)
+						return m, tea.ClearScreen
+					}
+
+					targets := m.currentOrSelectedResolved()
+					if len(targets) == 0 {
+						m.setStatus("No target selected", 1500)
+						return m, tea.ClearScreen
+					}
+
+					// We create panes/windows and then send macro commands with logging markers.
+					// This is best-effort "send after connect": we start SSH and then delay briefly
+					// before sending macro commands via tmux send-keys into the target pane.
+					failed := 0
+					sent := 0
+					for _, r := range targets {
+						var paneID string
+						var err error
+
+						switch mode {
+						case "connect":
+							// Same as default connect (new window) for safety.
+							fallthrough
+						case "window":
+							paneID, err = m.tmuxNewWindow(r)
+						case "split v":
+							paneID, err = m.tmuxSplitH(r)
+						case "split h":
+							paneID, err = m.tmuxSplitV(r)
+						default:
+							m.setStatus("Usage: :run <macro> [split v|h|window|connect]", 3500)
+							return m, tea.ClearScreen
+						}
+
+						if err != nil {
+							failed++
+							continue
+						}
+						m.addRecent(r.Host.Name)
+
+						// Track mapping so :send/:dash save can work later.
+						if strings.TrimSpace(paneID) != "" {
+							if m.paneHost == nil {
+								m.paneHost = make(map[string]string)
+							}
+							m.paneHost[strings.TrimSpace(paneID)] = strings.TrimSpace(r.Host.Name)
+						}
+
+						// If we have a target pane id, delay after starting SSH before sending macro commands,
+						// then send and log them.
+						if strings.TrimSpace(paneID) != "" {
+							// Use effective per-host delay if configured; otherwise default to 500ms.
+							delayMS := r.EffectiveConnectDelayMS
+							if delayMS <= 0 {
+								delayMS = 500
+							}
+							time.Sleep(time.Duration(delayMS) * time.Millisecond)
+
+							m.sendRecorded(r.Host.Name, paneID, mac.Commands)
+							sent++
+						}
+					}
+
+					if failed > 0 {
+						m.setStatus(fmt.Sprintf("Opened %d, %d failed • Macro sent to %d pane(s)", len(targets)-failed, failed, sent), 4500)
+					} else {
+						m.setStatus(fmt.Sprintf("Opened %d • Macro sent to %d pane(s)", len(targets), sent), 3000)
+					}
+
+					m.saveState()
+					return m.quit()
+
+				case "record":
+					// Minimal recorder UI:
+					// - :record start <name> [description...]
+					// - :record stop
+					// - :record status
+					// - :record save [name]
+					// - :record delete <name>
+					subArgs := strings.Fields(strings.TrimSpace(rest))
+					sub := ""
+					if len(subArgs) > 0 {
+						sub = strings.ToLower(strings.TrimSpace(subArgs[0]))
+					}
+					switch sub {
+					case "", "status":
+						if m.recording {
+							m.setStatus(fmt.Sprintf("recording: ON (%s)", strings.TrimSpace(m.recordingName)), 3500)
+						} else {
+							m.setStatus("recording: OFF", 2500)
+						}
+						return m, tea.ClearScreen
+
+					case "start":
+						// record start <name> [desc...]
+						if len(subArgs) < 2 || strings.TrimSpace(subArgs[1]) == "" {
+							m.setStatus("Usage: :record start <name> [description...]", 3500)
+							return m, tea.ClearScreen
+						}
+						name := strings.TrimSpace(subArgs[1])
+						desc := ""
+						if len(subArgs) > 2 {
+							desc = strings.TrimSpace(strings.Join(subArgs[2:], " "))
+						}
+						m.recording = true
+						m.recordingName = name
+						m.recordingDescription = desc
+						m.recordedPanes = make(map[string]*RecordedPane)
+						m.setStatus(fmt.Sprintf("recording started: %s", name), 3000)
+						return m, tea.ClearScreen
+
+					case "stop":
+						if !m.recording {
+							m.setStatus("recording: already stopped", 2000)
+							return m, tea.ClearScreen
+						}
+						m.recording = false
+						m.setStatus("recording stopped (use :record save)", 3000)
+						return m, tea.ClearScreen
+
+					case "save":
+						// record save [name]
+						name := strings.TrimSpace(m.recordingName)
+						if len(subArgs) >= 2 && strings.TrimSpace(subArgs[1]) != "" {
+							name = strings.TrimSpace(subArgs[1])
+						}
+						if name == "" {
+							m.setStatus("record save: missing name (use :record start <name> or :record save <name>)", 4500)
+							return m, tea.ClearScreen
+						}
+						if m.state == nil {
+							m.state = &State{Version: 1}
+						}
+						// Turn recorded panes into deterministic slice.
+						panes := make([]RecordedPane, 0, len(m.recordedPanes))
+						for _, rp := range m.recordedPanes {
+							if rp == nil {
+								continue
+							}
+							if strings.TrimSpace(rp.Host) == "" {
+								continue
+							}
+							// Keep only non-empty commands.
+							cmds := rp.Commands[:0]
+							for _, c := range rp.Commands {
+								c = strings.TrimSpace(c)
+								if c != "" {
+									cmds = append(cmds, c)
+								}
+							}
+							rp.Commands = cmds
+							panes = append(panes, *rp)
+						}
+						if len(panes) == 0 {
+							m.setStatus("record save: nothing to save yet (only records commands the manager sends)", 4500)
+							return m, tea.ClearScreen
+						}
+						rd := RecordedDashboard{
+							Name:        name,
+							Description: strings.TrimSpace(m.recordingDescription),
+							Panes:       panes,
+						}
+						_ = m.state.UpsertRecordedDashboard(rd)
+						m.saveState()
+						m.setStatus(fmt.Sprintf("recorded dashboard saved: %s", name), 3500)
+						return m, tea.ClearScreen
+
+					case "delete", "del", "rm":
+						if len(subArgs) < 2 || strings.TrimSpace(subArgs[1]) == "" {
+							m.setStatus("Usage: :record delete <name>", 3500)
+							return m, tea.ClearScreen
+						}
+						name := strings.TrimSpace(subArgs[1])
+						if m.state == nil {
+							m.state = &State{Version: 1}
+						}
+						if m.state.DeleteRecordedDashboard(name) {
+							m.saveState()
+							m.setStatus(fmt.Sprintf("recorded dashboard deleted: %s", name), 3000)
+						} else {
+							m.setStatus(fmt.Sprintf("record delete: not found: %s", name), 3500)
+						}
+						return m, tea.ClearScreen
+
+					default:
+						m.setStatus("Usage: :record start|stop|status|save|delete", 3500)
+						return m, tea.ClearScreen
+					}
+
+				default:
+					m.setStatus(fmt.Sprintf("Unknown command: %s (try :menu)", raw), 3500)
+					return m, tea.ClearScreen
+				}
+
+			default:
+				var tcmd tea.Cmd
+				m.cmdline, tcmd = m.cmdline.Update(msg)
+				return m, tcmd
+			}
+		}
+
+		// When search has focus, prioritize it
+		if m.input.Focused() {
+			var cmd tea.Cmd
+			m.input, cmd = m.input.Update(msg)
+
+			// update filter on any change
+			m.recomputeFilter()
+			return m, cmd
+		}
+
+		// Not focused: handle motions, actions, numeric selects
+		k := msg.String()
+
+		// Numeric quick-select buffer
+		if isDigitKey(k) {
+			m.numBuf += k
+			m.setStatus(fmt.Sprintf("Number: %s (Enter to select)", m.numBuf), 1500)
+			return m, nil
+		}
+		if k == "enter" && m.numBuf != "" {
+			// Connect to given index (1-based)
+			idx, _ := strconv.Atoi(m.numBuf)
+			m.numBuf = ""
+			if idx >= 1 && idx <= len(m.filtered) {
+				return m.connectOrQuit(m.filtered[idx-1].Resolved)
+			}
+			m.setStatus("Invalid index", 1200)
+			return m, nil
+		}
+		if k == "backspace" && m.numBuf != "" {
+			if len(m.numBuf) > 0 {
+				m.numBuf = m.numBuf[:len(m.numBuf)-1]
+			}
+			return m, nil
+		}
+		if k == "esc" && m.numBuf != "" {
+			m.numBuf = ""
+			return m, nil
+		}
+
+		// Motions
+		switch k {
+		case "j", "down":
+			m.move(1)
+			return m, nil
+		case "k", "up":
+			m.move(-1)
+			return m, nil
+		case "n":
+			// Next match (vim): move in the current search direction through the filtered list.
+			// Since the list is already filtered by the query, "next match" == next item.
+			if m.searchForward {
+				m.move(1)
+			} else {
+				m.move(-1)
+			}
+			return m, nil
+		case "N":
+			// Previous match (vim): opposite direction of "n".
+			if m.searchForward {
+				m.move(-1)
+			} else {
+				m.move(1)
+			}
+			return m, nil
+		case "g":
+			// "gg" to go to top
+			if m.pendingG {
+				m.pendingG = false
+				m.gotoTop()
+			} else {
+				m.pendingG = true
+			}
+			return m, nil
+		case "G":
+			m.pendingG = false
+			m.gotoBottom()
+			return m, nil
+		case "u", "pgup", "ctrl+u":
+			// half-page up (vim)
+			m.pageUp()
+			return m, nil
+		case "d", "pgdown", "ctrl+d":
+			// half-page down (vim)
+			m.pageDown()
+			return m, nil
+		case "H":
+			m.pendingG = false
+			m.jumpGroupPrev()
+			return m, nil
+		case "L":
+			m.pendingG = false
+			m.jumpGroupNext()
+			return m, nil
+		}
+
+		// If logs viewer is active, it consumes most navigation keys.
+		if m.showLogs {
+			handled, m2, cmd := m.handleLogsKeys(msg)
+			if handled {
+				// handleLogsKeys returns the updated model by value.
+				// Return it directly to avoid interface/type assertion pitfalls.
+				return *m2, cmd
+			}
+			// If not handled, fall through to normal actions.
+		}
+
+		// Actions
+		switch k {
+		case "enter", "c":
+			// If there are multi-selected hosts, operate on all of them.
+			// Otherwise, operate on the current host.
+			targets := m.selectedResolved()
+			if len(targets) == 0 {
+				if sel := m.current(); sel != nil {
+					targets = []ResolvedHost{sel.Resolved}
+				}
+			}
+			if len(targets) == 0 {
+				return m, nil
+			}
+
+			// Connect in new tmux window(s) by default.
+			// If new-window fails for any reason, fall back to a vertical split for that target.
+			failed := 0
+			for _, r := range targets {
+				if _, err := m.tmuxNewWindow(r); err != nil {
+					// Fallback: split vertically
+					if _, serr := m.tmuxSplitV(r); serr != nil {
+						failed++
+						continue
+					}
+				}
+				m.addRecent(r.Host.Name)
+			}
+
+			if failed > 0 {
+				m.setStatus(fmt.Sprintf("Opened %d, %d failed", len(targets)-failed, failed), 2500)
+			}
+			m.saveState()
+			return m.quit()
+		case "l":
+			// Open per-host logs viewer (daily logs under ~/.config/tmux-ssh-manager/logs/<hostkey>/YYYY-MM-DD.log)
+			if sel := m.current(); sel != nil {
+				m.pendingG = false
+				if err := m.openLogs(sel.Resolved.Host.Name); err != nil {
+					m.setStatus(fmt.Sprintf("logs: %v", err), 3500)
+					return m, nil
+				}
+				m.showLogs = true
+				return m, nil
+			}
+			return m, nil
+		case "O":
+			// Open today's per-host log in $PAGER (default: less +F) in a new tmux pane.
+			// We sanitize at view-time (strip CR + ANSI/control sequences) so the pager view
+			// doesn't show ESC[...] noise from pipe-pane logs.
+			if sel := m.current(); sel != nil {
+				hostKey := sel.Resolved.Host.Name
+				opts := DefaultLogOptions()
+				info, err := EnsureDailyHostLog(hostKey, time.Now(), opts)
+				if err != nil {
+					m.setStatus(fmt.Sprintf("open log: %v", err), 3500)
+					return m, nil
+				}
+
+				pager := strings.TrimSpace(os.Getenv("PAGER"))
+				if pager == "" {
+					pager = "less"
+				}
+
+				// Follow mode by default for tailing-like experience.
+				// Use bash -lc so users can set PAGER as an alias/func if they want.
+				//
+				// Notes:
+				// - `tr -d '\r'` removes ^M from CRLF / carriage-returned prompts.
+				// - `perl ...` strips common ANSI escape sequences (CSI/OSC/charset selects).
+				// - `less -R` is still fine; after stripping ANSI, it behaves like normal less.
+				filter := fmt.Sprintf(
+					"cat %s | tr -d '\\r' | perl -pe 's/\\e\\[[0-9;?]*[ -\\/]*[@-~]//g; s/\\e\\][^\\a]*(\\a|\\e\\\\)//g; s/\\e\\([A-Za-z0-9]//g; s/\\e\\][0-9];.*?\\a//g' | %s -R +F",
+					shellEscapeForSh(info.Path),
+					shellEscapeForSh(pager),
+				)
+
+				// Prefer a split pane for viewing.
+				_ = exec.Command("tmux", "split-window", "-v", "-c", "#{pane_current_path}", "bash", "-lc", filter).Run()
+				m.setStatus("Opened log in pager", 1500)
+				return m, nil
+			}
+			return m, nil
+		case "S":
+			// Host Settings overlay (SecureCRT-like session properties)
+			m.pendingG = false
+			m.input.Blur()
+			m.showHelp = false
+			m.showHostSettings = true
+			m.hostSettingsSel = 0
+			return m, tea.ClearScreen
+
+		case "T":
+			// Toggle per-host logging policy (default ON unless explicitly disabled).
+			// Persisted to: ~/.config/tmux-ssh-manager/hosts/<hostkey>.conf as `logging=true|false`.
+			if sel := m.current(); sel != nil {
+				hostKey := strings.TrimSpace(sel.Resolved.Host.Name)
+				ex, _ := LoadHostExtras(hostKey)
+				ex.HostKey = hostKey
+
+				// Flip and persist
+				ex.Logging = !ex.Logging
+				if err := SaveHostExtras(ex); err != nil {
+					m.setStatus(fmt.Sprintf("Logging toggle failed: %v", err), 3500)
+					return m, nil
+				}
+
+				if ex.Logging {
+					m.setStatus("Logging: enabled", 1500)
+				} else {
+					m.setStatus("Logging: disabled", 1500)
+				}
+				return m, nil
+			}
+			return m, nil
+		case "K":
+			// Deprecated: key install moved into Host Settings (S) to make the workflow more discoverable.
+			// Use: S (Host Settings) -> "Install my public key (authorized_keys)".
+			m.setStatus("Key install moved: press S (Host Settings) and select 'Install my public key'", 3500)
+			return m, nil
+		case " ":
+			// toggle multi-select for current row
+			if sel := m.current(); sel != nil {
+				if _, ok := m.selectedSet[m.selected]; ok {
+					delete(m.selectedSet, m.selected)
+				} else {
+					m.selectedSet[m.selected] = struct{}{}
+				}
+				m.setStatus(fmt.Sprintf("Selected: %d", m.selectedCount()), 1200)
+			}
+			return m, nil
+		case "f":
+			// toggle favorite on current host
+			if sel := m.current(); sel != nil {
+				name := sel.Resolved.Host.Name
+				if m.isFavorite(name) {
+					m.unfavorite(name)
+					m.setStatus("Removed from favorites", 1200)
+				} else {
+					m.favorite(name)
+					m.setStatus("Added to favorites", 1200)
+				}
+				m.recomputeFilter()
+				m.saveState()
+			}
+			return m, nil
+		case "F":
+			// filter favorites
+			m.filterFavorites = !m.filterFavorites
+			m.filterRecents = false
+			m.recomputeFilter()
+			return m, nil
+		case "R":
+			// filter recents
+			m.filterRecents = !m.filterRecents
+			m.filterFavorites = false
+			m.recomputeFilter()
+			return m, nil
+		case "A":
+			// clear filters
+			m.filterFavorites = false
+			m.filterRecents = false
+			m.recomputeFilter()
+			return m, nil
+		case "v":
+			// If there are multi-selected hosts, split and connect each of them (side-by-side).
+			// Otherwise, operate on the current host.
+			targets := m.selectedResolved()
+			if len(targets) == 0 {
+				if sel := m.current(); sel != nil {
+					targets = []ResolvedHost{sel.Resolved}
+				}
+			}
+			if len(targets) == 0 {
+				return m, nil
+			}
+
+			failed := 0
+			for _, r := range targets {
+				if _, err := m.tmuxSplitH(r); err != nil {
+					failed++
+					continue
+				}
+				m.addRecent(r.Host.Name)
+			}
+
+			// Optional: after batch split, apply a tiled layout (opt-in; default is sequential splits).
+			// Enable with: TMUX_SSH_MANAGER_TILED_AFTER_BATCH_SPLIT=1
+			if len(targets) > 1 && strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_TILED_AFTER_BATCH_SPLIT")) != "" &&
+				os.Getenv("TMUX_SSH_MANAGER_TILED_AFTER_BATCH_SPLIT") != "0" {
+				_ = exec.Command("tmux", "select-layout", "tiled").Run()
+			}
+
+			if failed > 0 {
+				m.setStatus(fmt.Sprintf("Opened %d, %d failed", len(targets)-failed, failed), 2500)
+			}
+			m.saveState()
+			return m.quit()
+
+		case "s":
+			// If there are multi-selected hosts, split and connect each of them (stacked).
+			// Otherwise, operate on the current host.
+			targets := m.selectedResolved()
+			if len(targets) == 0 {
+				if sel := m.current(); sel != nil {
+					targets = []ResolvedHost{sel.Resolved}
+				}
+			}
+			if len(targets) == 0 {
+				return m, nil
+			}
+
+			failed := 0
+			for _, r := range targets {
+				if _, err := m.tmuxSplitV(r); err != nil {
+					failed++
+					continue
+				}
+				m.addRecent(r.Host.Name)
+			}
+
+			// Optional: after batch split, apply a tiled layout (opt-in; default is sequential splits).
+			// Enable with: TMUX_SSH_MANAGER_TILED_AFTER_BATCH_SPLIT=1
+			if len(targets) > 1 && strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_TILED_AFTER_BATCH_SPLIT")) != "" &&
+				os.Getenv("TMUX_SSH_MANAGER_TILED_AFTER_BATCH_SPLIT") != "0" {
+				_ = exec.Command("tmux", "select-layout", "tiled").Run()
+			}
+
+			if failed > 0 {
+				m.setStatus(fmt.Sprintf("Opened %d, %d failed", len(targets)-failed, failed), 2500)
+			}
+			m.saveState()
+			return m.quit()
+
+		case "w":
+			// If there are multi-selected hosts, open a new window for each.
+			// Otherwise, operate on the current host.
+			targets := m.selectedResolved()
+			if len(targets) == 0 {
+				if sel := m.current(); sel != nil {
+					targets = []ResolvedHost{sel.Resolved}
+				}
+			}
+			if len(targets) == 0 {
+				return m, nil
+			}
+
+			failed := 0
+			for _, r := range targets {
+				if _, err := m.tmuxNewWindow(r); err != nil {
+					failed++
+					continue
+				}
+				m.addRecent(r.Host.Name)
+			}
+			if failed > 0 {
+				m.setStatus(fmt.Sprintf("Opened %d, %d failed", len(targets)-failed, failed), 2500)
+			}
+			m.saveState()
+			return m.quit()
+		case "W":
+			// batch: open each selected in a new window (or current if none selected)
+			targets := m.selectedResolved()
+			if len(targets) == 0 {
+				if sel := m.current(); sel != nil {
+					targets = []ResolvedHost{sel.Resolved}
+				}
+			}
+			failed := 0
+			for _, r := range targets {
+				if _, err := m.tmuxNewWindow(r); err != nil {
+					failed++
+				} else {
+					m.addRecent(r.Host.Name)
+				}
+			}
+			if failed > 0 {
+				m.setStatus(fmt.Sprintf("Opened %d, %d failed", len(targets)-failed, failed), 2500)
+			}
+			m.saveState()
+			return m.quit()
+		case "y":
+			if sel := m.current(); sel != nil {
+				// Prefer the wrapper form so yanked commands work even if the user has `alias ssh='tmux-ssh-manager ssh'`,
+				// and so credential automation behavior is consistent.
+				//
+				// UX: avoid wrapping the TUI by abbreviating long absolute paths for display/yank:
+				// - if TMUX_SSH_MANAGER_BIN is an absolute path, render as "../<basename>"
+				// - otherwise keep as-is
+				binExec := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_BIN"))
+				if binExec == "" {
+					binExec = "tmux-ssh-manager"
+				}
+				binDisp := binExec
+				if strings.HasPrefix(binDisp, "/") {
+					binDisp = "../" + filepath.Base(binDisp)
+				}
+
+				hostKey := strings.TrimSpace(sel.Resolved.Host.Name)
+				userArg := strings.TrimSpace(sel.Resolved.EffectiveUser)
+				userFlag := ""
+				if userArg != "" {
+					userFlag = " --user " + shellEscapeForSh(userArg)
+				}
+				line := shellEscapeForSh(binDisp) + " ssh --tmux --host " + shellEscapeForSh(hostKey) + userFlag
+				if err := m.tmuxYank(line); err != nil {
+					m.setStatus(fmt.Sprintf("yank error: %v", err), 2500)
+					return m, nil
+				}
+				m.setStatus("Yanked SSH command to tmux buffer", 1200)
+			}
+			return m, nil
+		case "Y":
+			// batch yank
+			targets := m.selectedResolved()
+			if len(targets) == 0 {
+				if sel := m.current(); sel != nil {
+					targets = []ResolvedHost{sel.Resolved}
+				}
+			}
+			lines := make([]string, 0, len(targets))
+			for _, r := range targets {
+				// Prefer wrapper form for the same reasons as yank: consistent auth behavior + avoids alias recursion.
+				//
+				// UX: abbreviate long absolute paths for display/yank:
+				// - if TMUX_SSH_MANAGER_BIN is an absolute path, render as "../<basename>"
+				// - otherwise keep as-is
+				binExec := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_BIN"))
+				if binExec == "" {
+					binExec = "tmux-ssh-manager"
+				}
+				binDisp := binExec
+				if strings.HasPrefix(binDisp, "/") {
+					binDisp = "../" + filepath.Base(binDisp)
+				}
+
+				hostKey := strings.TrimSpace(r.Host.Name)
+				userArg := strings.TrimSpace(r.EffectiveUser)
+				userFlag := ""
+				if userArg != "" {
+					userFlag = " --user " + shellEscapeForSh(userArg)
+				}
+				lines = append(lines, shellEscapeForSh(binDisp)+" ssh --tmux --host "+shellEscapeForSh(hostKey)+userFlag)
+			}
+			if err := m.tmuxYank(strings.Join(lines, "\n")); err != nil {
+				m.setStatus(fmt.Sprintf("yank error: %v", err), 2500)
+			} else {
+				m.setStatus(fmt.Sprintf("Yanked %d commands", len(lines)), 1200)
+			}
+			return m, nil
+		case "/":
+			// Search forward (vim-ish). This focuses the search input and sets direction for n/N.
+			m.pendingG = false
+			m.searchForward = true
+			m.cmdline.Blur()
+			m.showCmdline = false
+			m.input.Focus()
+			return m, nil
+		case "?":
+			// Search backward (vim-ish). Focus the search input and set direction for n/N.
+			// Do NOT mutate the query string; direction is tracked separately.
+			m.pendingG = false
+			m.searchForward = false
+			m.cmdline.Blur()
+			m.showCmdline = false
+			m.input.Focus()
+			return m, nil
+		case ":":
+			// SecureCRT-like command bar
+			m.pendingG = false
+			m.input.Blur()
+			m.showHelp = false
+			m.showCmdline = true
+			m.cmdSuggestIdx = -1
+			if m.cmdCandidates == nil {
+				m.cmdCandidates = m.buildCmdCandidates()
+			}
+			m.cmdline.SetValue("")
+			m.cmdline.Focus()
+			return m, nil
+		case "h":
+			// Preserve single-key help as a convenience, but steer users toward :help.
+			m.pendingG = false
+			m.showHelp = true
+			return m, nil
+		case "B":
+			// Open dashboards browser
+			m.pendingG = false
+			m.input.Blur()
+			m.showDashBrowser = true
+			if m.dashSelected < 0 {
+				m.dashSelected = 0
+			}
+			return m, nil
+		}
+
+		// Treat other typed text as new search query (vim-ish)
+		if len(k) == 1 && k != " " {
+			m.input.Focus()
+			m.input.SetValue(m.input.Value() + k)
+			m.recomputeFilter()
+			return m, nil
+		}
+		return m, nil
+
+	}
+
+	return m, nil
+}
+
+func (m *model) handleGlobalKeys(k tea.KeyMsg) (handled bool, quit bool) {
+	switch k.String() {
+	case "ctrl+c":
+		// Important: Bubble Tea must receive tea.Quit, otherwise the program can
+		// appear to "hang" in tmux popups because the process is still running.
+		m.quitting = true
+		return true, true
+
+	case "q":
+		// In modals/overlays, q should behave like "close" (return to host list),
+		// not "quit the whole program". Only quit when no modal is active.
+		if m.showHelp || m.showLogs || m.showDashBrowser || m.showCmdline || m.showHostSettings {
+			return false, false
+		}
+		m.quitting = true
+		return true, true
+
+	case "ctrl+s":
+		// Save current window as a recorded dashboard (hotkey).
+		// This is intended for NOC workflows: build panes, :watchall ..., resize, then ctrl+s to save.
+		//
+		// Note: we avoid a dedicated prompt here; it saves under an auto-generated name.
+		// Users can later rename by editing state.json if desired.
+		if m.showHelp || m.showLogs || m.showCmdline || m.showHostSettings {
+			return false, false
+		}
+		if m.showDashBrowser {
+			// Let dashboard browser own ctrl+s in the future if desired.
+			return false, false
+		}
+
+		// Resolve current window id + layout
+		windowID := ""
+		if out, e := exec.Command("tmux", "display-message", "-p", "#{window_id}").Output(); e == nil {
+			windowID = strings.TrimSpace(string(out))
+		}
+		if windowID == "" {
+			m.setStatus("save: could not resolve tmux window id", 3500)
+			return true, false
+		}
+
+		layout := ""
+		if out, e := exec.Command("tmux", "display-message", "-p", "-t", windowID, "#{window_layout}").Output(); e == nil {
+			layout = strings.TrimSpace(string(out))
+		}
+
+		// Snapshot panes in this window. We only include panes we can map to a host.
+		panesOut, e := exec.Command("tmux", "list-panes", "-t", windowID, "-F", "#{pane_id}").Output()
+		if e != nil {
+			m.setStatus(fmt.Sprintf("save: list-panes failed: %v", e), 3500)
+			return true, false
+		}
+		lines := strings.Split(strings.TrimSpace(string(panesOut)), "\n")
+
+		panes := make([]RecordedPane, 0, len(lines))
+		for _, ln := range lines {
+			pid := strings.TrimSpace(ln)
+			if pid == "" {
+				continue
+			}
+			hostKey := ""
+			if m.paneHost != nil {
+				hostKey = strings.TrimSpace(m.paneHost[pid])
+			}
+			// If we can't map this pane to a host, skip it (it wasn't created/managed by us).
+			if hostKey == "" {
+				continue
+			}
+
+			// Pull any recorded commands for this pane (best-effort). If none, empty.
+			cmds := []string(nil)
+			if m.recordedPanes != nil {
+				if rp := m.recordedPanes[pid]; rp != nil && len(rp.Commands) > 0 {
+					cmds = append([]string(nil), rp.Commands...)
+				}
+			}
+
+			panes = append(panes, RecordedPane{
+				Title:    "",
+				Host:     hostKey,
+				Commands: cmds,
+			})
+		}
+
+		if len(panes) == 0 {
+			m.setStatus("save: no managed panes with known hosts in this window (open via tmux-ssh-manager first)", 5000)
+			return true, false
+		}
+
+		if m.state == nil {
+			m.state = &State{Version: 1}
+		}
+
+		// Auto-name: noc-YYYYmmdd-HHMMSS (local time)
+		recName := "noc-" + time.Now().Format("20060102-150405")
+		rd := RecordedDashboard{
+			Name:        recName,
+			Description: "saved from ctrl+s",
+			Layout:      layout,
+			Panes:       panes,
+		}
+		_ = m.state.UpsertRecordedDashboard(rd)
+		m.saveState()
+
+		if layout != "" {
+			m.setStatus(fmt.Sprintf("dashboard saved: %s (layout captured, %d pane(s))", recName, len(panes)), 4000)
+		} else {
+			m.setStatus(fmt.Sprintf("dashboard saved: %s (%d pane(s))", recName, len(panes)), 3500)
+		}
+		return true, false
+
+	case "esc":
+		// esc clears modal/help/log view or search focus
+		if m.showHelp {
+			m.showHelp = false
+			m.pendingG = false
+			m.input.Blur()
+			m.recomputeFilter()
+			return true, false
+		}
+		if m.showLogs {
+			// Close logs view and force a clean redraw on next tick.
+			m.showLogs = false
+			m.logHostKey = ""
+			m.logFilePath = ""
+			m.logFiles = nil
+			m.logSelected = 0
+			m.logStartLine = 0
+			m.logLines = nil
+			m.logTotalLines = 0
+			m.pendingG = false
+			m.input.Blur()
+			m.recomputeFilter()
+			return true, false
+		}
+		if m.showDashBrowser {
+			m.showDashBrowser = false
+			m.pendingG = false
+			m.input.Blur()
+			m.recomputeFilter()
+			return true, false
+		}
+
+		if m.input.Focused() {
+			m.input.Blur()
+			m.recomputeFilter()
+			return true, false
+		}
+	}
+	return false, false
+}
+
+// --- View ---
+
+func (m model) View() string {
+	if m.quitting {
+		return ""
+	}
+	if !m.ready {
+		return "tmux-ssh-manager: loading...\n"
+	}
+
+	var b strings.Builder
+
+	// Header (keep short; put details in help)
+	headerLeft := "tmux-ssh-manager — Sessions"
+	b.WriteString(m.theme.HeaderLine(headerLeft) + "\n")
+	b.WriteString(m.theme.apply(m.theme.Separator, strings.Repeat("-", minInt(len(headerLeft), maxInt(3, m.width)))) + "\n")
+
+	// Host Settings overlay view
+	if m.showHostSettings {
+		b.WriteString(m.theme.HeaderLine("Host Settings") + "\n")
+		b.WriteString(m.theme.apply(m.theme.Separator, strings.Repeat("-", maxInt(6, minInt(m.width, 40)))) + "\n")
+		if sel := m.current(); sel != nil {
+			hostKey := strings.TrimSpace(sel.Resolved.Host.Name)
+			loginMode := m.effectiveLoginMode(sel.Resolved)
+
+			credStatus := "unknown"
+			if err := CredGet(hostKey, sel.Resolved.EffectiveUser, "password"); err == nil {
+				credStatus = "available"
+			} else {
+				credStatus = "missing"
+			}
+
+			logPolicy := "on"
+			if ex, err := LoadHostExtras(hostKey); err == nil {
+				if ex.Logging {
+					logPolicy = "on"
+				} else {
+					logPolicy = "off"
+				}
+			}
+
+			lines := []string{
+				fmt.Sprintf("Host: %s", hostKey),
+				fmt.Sprintf("Login mode: %s", loginMode),
+				fmt.Sprintf("Credential: %s", credStatus),
+				fmt.Sprintf("Logging: %s", logPolicy),
+			}
+
+			// Render a tiny action list
+			items := []string{
+				"Toggle login mode (manual/askpass)",
+				"Set credential (Keychain)",
+				"Delete credential (Keychain)",
+				"Toggle logging",
+				"Install my public key (authorized_keys)",
+			}
+
+			for i, it := range items {
+				prefix := "   "
+				if i == m.hostSettingsSel {
+					prefix = " > "
+				}
+				b.WriteString(fmt.Sprintf("%s%2d) %s\n", prefix, i+1, it))
+			}
+
+			b.WriteString("\n")
+			for _, ln := range lines {
+				b.WriteString(ln + "\n")
+			}
+		} else {
+			b.WriteString("No host selected.\n")
+		}
+		b.WriteString("\nKeys: j/k move • Enter apply • Esc/q close\n")
+		return b.String()
+	}
+
+	// Dashboards browser view
+	if m.showDashBrowser {
+		b.WriteString(m.theme.HeaderLine("Dashboards") + "\n")
+		b.WriteString(m.theme.apply(m.theme.Separator, strings.Repeat("-", maxInt(6, minInt(m.width, 40)))) + "\n")
+
+		// Merge YAML dashboards with recorded dashboards from state (recorded shown alongside YAML).
+		allDash := make([]Dashboard, 0, 8)
+		if m.cfg != nil && len(m.cfg.Dashboards) > 0 {
+			allDash = append(allDash, m.cfg.Dashboards...)
+		}
+		if m.state != nil && len(m.state.RecordedDashboards) > 0 {
+			for _, rd := range m.state.RecordedDashboards {
+				allDash = append(allDash, rd.ToConfigDashboard())
+			}
+		}
+
+		// Clamp selection to bounds (config may be missing; list can shrink).
+		if len(allDash) == 0 {
+			m.dashSelected = 0
+		} else if m.dashSelected < 0 {
+			m.dashSelected = 0
+		} else if m.dashSelected >= len(allDash) {
+			m.dashSelected = len(allDash) - 1
+		}
+
+		if len(allDash) == 0 {
+			b.WriteString("No dashboards defined.\n")
+		} else {
+			for i, d := range allDash {
+				prefix := "   "
+				if i == m.dashSelected {
+					prefix = " > "
+				}
+				line := fmt.Sprintf("%s%2d) %s", prefix, i+1, d.Name)
+				if strings.TrimSpace(d.Description) != "" {
+					line += " - " + d.Description
+				}
+				b.WriteString(line + "\n")
+			}
+		}
+		layoutLabel := "default"
+		switch m.dashLayoutMode {
+		case 1:
+			layoutLabel = "tiled"
+		case 2:
+			layoutLabel = "even-horizontal"
+		case 3:
+			layoutLabel = "even-vertical"
+		case 4:
+			layoutLabel = "main-vertical"
+		case 5:
+			layoutLabel = "main-horizontal"
+		}
+		b.WriteString(fmt.Sprintf("\nKeys: j/k move • Enter open • l layout(%s) • Esc/q close • :help help\n", layoutLabel))
+		return b.String()
+	}
+	// Help overlay
+	if m.showHelp {
+		b.WriteString(m.theme.HelpText("Help") + "\n")
+		b.WriteString("Motions:\n")
+		b.WriteString("  j/k down/up • gg top • G bottom • u/d half-page • H/L prev/next group\n")
+		b.WriteString("Search/Exit:\n")
+		b.WriteString("  / search (forward) • ? search (backward) • n/N next/prev match • : command (try :menu) • q/esc quit\n\n")
+		b.WriteString(m.theme.HelpText("Actions (current/selected):") + "\n")
+		b.WriteString("  Ctrl+s: save current window as a recorded dashboard (auto-named)\n")
+		b.WriteString("  Enter or c: connect in new tmux window (default)\n")
+		b.WriteString("  v: split vertically (side-by-side) and connect\n")
+		b.WriteString("  s: split horizontally (stacked) and connect\n")
+		b.WriteString("  w: new window and connect   W: new window for all selected\n")
+		b.WriteString("  y: yank ssh command         Y: yank commands for all selected\n")
+		b.WriteString("  B: dashboards (open browser)\n")
+		b.WriteString("  S: host settings (login/cred/logging/key install)\n")
+		b.WriteString("  Space: toggle multi-select • f: toggle favorite on current\n")
+		b.WriteString("  F: favorites filter • R: recents filter • A: clear filter\n\n")
+		b.WriteString(m.theme.HelpText("Logs:") + "\n")
+		b.WriteString("  l: open logs • O: open in $PAGER (less +F) • T: toggle logging\n")
+		b.WriteString("  In logs view: j/k scroll • d/u half-page • gg/G top/bot • J/K file • r reload • q/esc close\n\n")
+		b.WriteString("Press Esc or q to close help (use :help or h to open)\n")
+		return b.String()
+	}
+
+	// ":" command line (vim-like)
+	if m.showCmdline {
+		b.WriteString(fmt.Sprintf("Command: %s\n\n", m.cmdline.View()))
+	} else {
+		// Search + mode line (compact "chips")
+		searchLine := fmt.Sprintf("Search: %s", m.input.View())
+		if strings.TrimSpace(m.input.Value()) != "" && !m.searchForward {
+			searchLine += "   (reverse)"
+		}
+
+		modeBits := []string{}
+		if m.filterFavorites {
+			modeBits = append(modeBits, "favorites")
+		}
+		if m.filterRecents {
+			modeBits = append(modeBits, "recents")
+		}
+		if len(modeBits) > 0 {
+			searchLine += "   Mode: " + strings.Join(modeBits, ", ")
+		}
+		if m.numBuf != "" {
+			searchLine += fmt.Sprintf("   Num: %s", m.numBuf)
+		}
+		b.WriteString(searchLine + "\n\n")
+	}
+
+	// Status (ephemeral)
+	if m.status != "" && time.Now().Before(m.statusUntil) {
+		b.WriteString(fmt.Sprintf("%s\n\n", m.status))
+	}
+
+	// Dimensions for two-pane layout
+	listHeight := m.height - 8 // header + blank + search/status + footer estimate
+	if listHeight < 8 {
+		listHeight = 8
+	}
+	leftWidth := int(float64(m.width) * 0.56)
+	if leftWidth < 40 {
+		leftWidth = minInt(40, m.width-20)
+	}
+	if leftWidth > m.width-10 {
+		leftWidth = m.width - 10
+	}
+	rightWidth := m.width - leftWidth - 1 // 1 for separator
+
+	// Build left list lines
+	leftLines := []string{}
+	if len(m.filtered) == 0 {
+		leftLines = append(leftLines, "No matches.")
+	} else {
+		// Ensure selection visible
+		if m.selected < m.scroll {
+			m.scroll = m.selected
+		}
+		if m.selected >= m.scroll+listHeight {
+			m.scroll = m.selected - listHeight + 1
+		}
+		if m.scroll < 0 {
+			m.scroll = 0
+		}
+		end := m.scroll + listHeight
+		if end > len(m.filtered) {
+			end = len(m.filtered)
+		}
+		for i := m.scroll; i < end; i++ {
+			_, sel := m.selectedSet[i]
+			name := m.filtered[i].Resolved.Host.Name
+			line := m.theme.ListLine(i+1, i == m.selected, sel, m.isFavorite(name), m.filtered[i].Display)
+			leftLines = append(leftLines, line)
+		}
+		if end < len(m.filtered) {
+			leftLines = append(leftLines, fmt.Sprintf("… (+%d more)", len(m.filtered)-end))
+		}
+	}
+
+	// Build right preview for current selection (denser)
+	rightLines := []string{}
+	if sel := m.current(); sel != nil {
+		r := sel.Resolved
+		rightLines = append(rightLines, m.theme.HeaderLine("Preview"))
+		rightLines = append(rightLines, m.theme.apply(m.theme.Separator, strings.Repeat("-", maxInt(6, minInt(rightWidth, 20)))))
+
+		// Host summary line: user@host:port (jump ...)
+		hostPart := r.Host.Name
+		if r.EffectiveUser != "" {
+			hostPart = r.EffectiveUser + "@" + hostPart
+		}
+		if r.EffectivePort > 0 {
+			hostPart = fmt.Sprintf("%s:%d", hostPart, r.EffectivePort)
+		}
+		if r.EffectiveJumpHost != "" {
+			hostPart = fmt.Sprintf("%s  (jump %s)", hostPart, r.EffectiveJumpHost)
+		}
+		rightLines = append(rightLines, hostPart)
+
+		// Group (prefer configured; otherwise derive from domain)
+		group := "(none)"
+		if r.Group != nil && r.Group.Name != "" {
+			group = r.Group.Name
+		} else if idx := strings.IndexByte(r.Host.Name, '.'); idx > 0 {
+			group = r.Host.Name[idx+1:]
+		}
+
+		// Group + tags on one line when possible
+		metaBits := []string{"group: " + group}
+		if len(r.Host.Tags) > 0 {
+			metaBits = append(metaBits, "tags: "+strings.Join(r.Host.Tags, ", "))
+		}
+		rightLines = append(rightLines, strings.Join(metaBits, " • "))
+
+		// Logging indicators:
+		// 1) Policy (per-host extras): default ON unless explicitly disabled in ~/.config/tmux-ssh-manager/hosts/<host>.conf
+		// 2) Current pane state (tmux pipe-pane): best-effort for *this* pane only.
+		policy := "on"
+		if ex, err := LoadHostExtras(r.Host.Name); err == nil {
+			if ex.Logging {
+				policy = "on"
+			} else {
+				policy = "off"
+			}
+		}
+
+		logState := "unknown"
+		if out, err := TmuxOutput("display-message", "-p", "#{pane_pipe}"); err == nil {
+			v := strings.TrimSpace(out)
+			if v == "1" {
+				logState = "on"
+			} else if v == "0" {
+				logState = "off"
+			}
+		}
+		rightLines = append(rightLines, fmt.Sprintf("logging: policy=%s • pane=%s", policy, logState))
+
+		rightLines = append(rightLines, "")
+		rightLines = append(rightLines, "SSH:")
+		// Prefer wrapper form so preview matches what will actually be executed (and avoids alias recursion).
+		//
+		// UX: abbreviate long absolute paths to avoid wrapping the left list:
+		// - if TMUX_SSH_MANAGER_BIN is an absolute path, render as "../<basename>"
+		// - otherwise keep as-is
+		binExec := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_BIN"))
+		if binExec == "" {
+			binExec = "tmux-ssh-manager"
+		}
+		binDisp := binExec
+		if strings.HasPrefix(binDisp, "/") {
+			binDisp = "../" + filepath.Base(binDisp)
+		}
+
+		hostKey := strings.TrimSpace(r.Host.Name)
+		userArg := strings.TrimSpace(r.EffectiveUser)
+		userFlag := ""
+		if userArg != "" {
+			userFlag = " --user " + shellEscapeForSh(userArg)
+		}
+
+		// Render the wrapper binary on its own line to avoid overflow/wrapping into the left list.
+		rightLines = append(rightLines, "  "+shellEscapeForSh(binDisp))
+		rightLines = append(rightLines, "  ssh --tmux --host "+shellEscapeForSh(hostKey)+userFlag)
+
+		// Selection state (keep brief)
+		rightLines = append(rightLines, "")
+		selCount := m.selectedCount()
+		if selCount > 0 {
+			rightLines = append(rightLines, fmt.Sprintf("selected: %d", selCount))
+		}
+		if m.isFavorite(r.Host.Name) {
+			rightLines = append(rightLines, "★ favorite")
+		}
+	} else {
+		rightLines = append(rightLines, m.theme.HeaderLine("Preview"))
+		rightLines = append(rightLines, m.theme.apply(m.theme.Separator, strings.Repeat("-", maxInt(6, minInt(rightWidth, 20)))))
+		rightLines = append(rightLines, "(no selection)")
+	}
+
+	// If log viewer is active, render it instead of the normal selector columns.
+	if m.showLogs {
+		return m.viewLogs()
+	}
+
+	// Render two columns (width-aware, ANSI-safe)
+	//
+	// Important: do NOT use len() for truncation/padding because these strings can contain
+	// ANSI escape sequences and/or multibyte runes. Using byte-length causes the right
+	// column to "jitter" or appear to shift as you move selection.
+	maxLines := len(leftLines)
+	if len(rightLines) > maxLines {
+		maxLines = len(rightLines)
+	}
+
+	leftStyle := lipgloss.NewStyle().Width(maxInt(0, leftWidth)).MaxWidth(maxInt(0, leftWidth))
+	rightStyle := lipgloss.NewStyle().Width(maxInt(0, rightWidth)).MaxWidth(maxInt(0, rightWidth))
+
+	for i := 0; i < maxLines; i++ {
+		ll := ""
+		rl := ""
+		if i < len(leftLines) {
+			ll = leftLines[i]
+		}
+		if i < len(rightLines) {
+			rl = rightLines[i]
+		}
+
+		// Clamp + pad to fixed widths.
+		if leftWidth > 0 {
+			ll = leftStyle.Render(ll)
+		}
+		if rightWidth > 0 {
+			rl = rightStyle.Render(rl)
+		}
+
+		sep := " "
+		if rightWidth > 0 {
+			sep = m.theme.SeparatorRune()
+		}
+		b.WriteString(ll + sep + rl + "\n")
+	}
+
+	// Footer hints (essentials only; full reference lives in :menu and :help)
+	managed := 0
+	if m.paneHost != nil {
+		managed = len(m.paneHost)
+	}
+	recState := "OFF"
+	if m.recording {
+		recState = "ON"
+	}
+	b.WriteString(fmt.Sprintf("\nKeys: j/k move • / search • ? reverse • Enter connect • Space multi • S host settings • :menu • :help • q quit   |   managed panes: %d   |   REC: %s\n", managed, recState))
+
+	return b.String()
+}
+
+// --- Helpers ---
+
+func (m *model) recomputeFilter() {
+	q := strings.TrimSpace(m.input.Value())
+	all := rankMatches(m.candidates, q)
+
+	// apply favorites/recents filters if set
+	filtered := make([]candidate, 0, len(all))
+	if m.filterFavorites || m.filterRecents {
+		rec := make(map[string]struct{}, len(m.recents))
+		for _, n := range m.recents {
+			rec[n] = struct{}{}
+		}
+		for _, c := range all {
+			name := c.Resolved.Host.Name
+			if m.filterFavorites && !m.isFavorite(name) {
+				continue
+			}
+			if m.filterRecents {
+				if _, ok := rec[name]; !ok {
+					continue
+				}
+			}
+			filtered = append(filtered, c)
+		}
+	} else {
+		filtered = all
+	}
+
+	m.filtered = filtered
+	if m.selected >= len(m.filtered) {
+		m.selected = len(m.filtered) - 1
+	}
+	if m.selected < 0 {
+		m.selected = 0
+	}
+	m.scroll = 0
+}
+
+// favorites helpers
+func (m *model) isFavorite(name string) bool {
+	_, ok := m.favorites[name]
+	return ok
+}
+func (m *model) favorite(name string) {
+	m.favorites[name] = struct{}{}
+}
+func (m *model) unfavorite(name string) {
+	delete(m.favorites, name)
+}
+
+// recents helpers
+func (m *model) addRecent(name string) {
+	// move to front; keep unique; cap at 50
+	if name == "" {
+		return
+	}
+	// remove if exists
+	newList := make([]string, 0, len(m.recents)+1)
+	newList = append(newList, name)
+	for _, n := range m.recents {
+		if n != name {
+			newList = append(newList, n)
+		}
+	}
+	if len(newList) > 50 {
+		newList = newList[:50]
+	}
+	m.recents = newList
+}
+
+// selection helpers
+func (m *model) selectedCount() int {
+	return len(m.selectedSet)
+}
+func (m *model) selectedResolved() []ResolvedHost {
+	if len(m.selectedSet) == 0 {
+		return nil
+	}
+	out := make([]ResolvedHost, 0, len(m.selectedSet))
+	for idx := range m.selectedSet {
+		if idx >= 0 && idx < len(m.filtered) {
+			out = append(out, m.filtered[idx].Resolved)
+		}
+	}
+	return out
+}
+
+// group navigation
+func groupKeyForCandidate(c candidate) string {
+	if c.Resolved.Group != nil && c.Resolved.Group.Name != "" {
+		return c.Resolved.Group.Name
+	}
+	name := c.Resolved.Host.Name
+	if i := strings.IndexByte(name, '.'); i > 0 && i+1 < len(name) {
+		return name[i+1:]
+	}
+	return "(ungrouped)"
+}
+func (m *model) jumpGroupPrev() {
+	if len(m.filtered) == 0 {
+		return
+	}
+	curKey := groupKeyForCandidate(m.filtered[m.selected])
+	// scan backwards for first index with a different group, then jump to its first occurrence
+	targetKey := curKey
+	for i := m.selected - 1; i >= 0; i-- {
+		g := groupKeyForCandidate(m.filtered[i])
+		if g != targetKey {
+			// find first index of this group
+			first := i
+			for j := i - 1; j >= 0; j-- {
+				if groupKeyForCandidate(m.filtered[j]) != g {
+					break
+				}
+				first = j
+			}
+			m.selected = first
+			return
+		}
+	}
+	// wrap to first if none
+	m.selected = 0
+}
+func (m *model) jumpGroupNext() {
+	if len(m.filtered) == 0 {
+		return
+	}
+	curKey := groupKeyForCandidate(m.filtered[m.selected])
+	// scan forward for first index with a different group
+	for i := m.selected + 1; i < len(m.filtered); i++ {
+		g := groupKeyForCandidate(m.filtered[i])
+		if g != curKey {
+			m.selected = i
+			return
+		}
+	}
+	// wrap to last
+	m.selected = len(m.filtered) - 1
+}
+
+// util
+// padRight previously did byte-length based padding/truncation, which breaks alignment for
+// ANSI-styled strings and multibyte runes. Column layout is now handled by lipgloss width-aware
+// rendering; keep this function as a no-op wrapper for backward compatibility (not used).
+func padRight(s string, w int) string {
+	return s
+}
+
+func (m *model) saveState() {
+	if m == nil {
+		return
+	}
+	// Compose state from current favorites/recents (+ recorded dashboards if present)
+	st := &State{
+		Version:   1,
+		Favorites: make([]string, 0, len(m.favorites)),
+		Recents:   append([]string(nil), m.recents...),
+	}
+	for n := range m.favorites {
+		if strings.TrimSpace(n) != "" {
+			st.Favorites = append(st.Favorites, n)
+		}
+	}
+
+	// Preserve/emit recorded dashboards:
+	// - m.state is loaded at startup and may already contain recordings
+	// - we keep them stable unless a future UI flow updates them
+	if m.state != nil && len(m.state.RecordedDashboards) > 0 {
+		st.RecordedDashboards = append([]RecordedDashboard(nil), m.state.RecordedDashboards...)
+	}
+
+	path := m.statePath
+	if path == "" {
+		if p, err := DefaultStatePath(); err == nil {
+			path = p
+		}
+	}
+	_ = SaveState(path, st)
+	m.state = st
+}
+
+func (m *model) current() *candidate {
+	if len(m.filtered) == 0 || m.selected < 0 || m.selected >= len(m.filtered) {
+		return nil
+	}
+	return &m.filtered[m.selected]
+}
+
+func (m *model) move(delta int) {
+	if len(m.filtered) == 0 {
+		return
+	}
+	m.pendingG = false
+	m.numBuf = ""
+	m.selected += delta
+	if m.selected < 0 {
+		m.selected = 0
+	}
+	if m.selected >= len(m.filtered) {
+		m.selected = len(m.filtered) - 1
+	}
+}
+
+func (m *model) gotoTop() {
+	m.selected = 0
+	m.scroll = 0
+}
+
+func (m *model) gotoBottom() {
+	if len(m.filtered) == 0 {
+		return
+	}
+	m.selected = len(m.filtered) - 1
+}
+
+func (m *model) pageUp() {
+	if len(m.filtered) == 0 {
+		return
+	}
+	half := maxInt(3, m.opts.MaxResults/2)
+	m.selected -= half
+	if m.selected < 0 {
+		m.selected = 0
+	}
+}
+
+func (m *model) pageDown() {
+	if len(m.filtered) == 0 {
+		return
+	}
+	half := maxInt(3, m.opts.MaxResults/2)
+	m.selected += half
+	if m.selected >= len(m.filtered) {
+		m.selected = len(m.filtered) - 1
+	}
+}
+
+func (m *model) setStatus(s string, ms int) {
+	m.status = s
+	m.statusUntil = time.Now().Add(time.Duration(ms) * time.Millisecond)
+}
+
+func (m model) quit() (tea.Model, tea.Cmd) {
+	// Do NOT kill tmux panes/windows created during this session.
+	//
+	// Users expect splits/new windows started by the manager (v/s/w/W, dashboards)
+	// to remain alive after the selector exits. Previously, we tracked created
+	// panes/windows and killed them on quit, which caused sessions to "disappear"
+	// immediately after connecting.
+	//
+	// If you ever want an explicit cleanup behavior again, make it an opt-in key
+	// binding or a config option.
+	m2 := m
+	m2.quitting = true
+	return m2, tea.Quit
+}
+
+func (m model) connectOrQuit(r ResolvedHost) (tea.Model, tea.Cmd) {
+	// Pre-connect local hooks
+	_ = runLocalHooks(r.EffectivePreConnect)
+
+	// Use existing connect helper to honor ExecReplace
+	err := connect(r, m.opts.ExecReplace)
+	if err != nil {
+		m2 := m
+		m2.setStatus(fmt.Sprintf("ssh error: %v", err), 2500)
+		return m2, nil
+	}
+
+	// Post-connect local hooks
+	_ = runLocalHooks(r.EffectivePostConnect)
+
+	// Track recents and exit UI (when not replaced)
+	m2 := m
+	m2.addRecent(r.Host.Name)
+	m2.saveState()
+	return m2.quit()
+}
+
+func (m *model) tmuxSplitH(r ResolvedHost) (string, error) {
+	// Build launch line.
+	//
+	// IMPORTANT:
+	// - For askpass: use the internal PTY connector (__connect) so Keychain automation works.
+	// - For manual/identity: run the real OpenSSH client directly (`command ssh ...`) to avoid
+	//   double tmux-wrapping / wrapper re-entry (especially when users alias ssh->tmux-ssh-manager ssh).
+	line := ""
+	if strings.EqualFold(strings.TrimSpace(m.effectiveLoginMode(r)), "askpass") {
+		bin := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_BIN"))
+		if bin == "" {
+			bin = "tmux-ssh-manager"
+		}
+		userFlag := ""
+		if strings.TrimSpace(r.EffectiveUser) != "" {
+			userFlag = " --user " + shellEscapeForSh(strings.TrimSpace(r.EffectiveUser))
+		}
+		line = shellEscapeForSh(bin) + " __connect --host " + shellEscapeForSh(strings.TrimSpace(r.Host.Name)) + userFlag
+	} else {
+		argv := BuildSSHCommand(r)
+		// Bypass any shell alias/function for ssh.
+		line = "command " + shellQuoteCmdSimple(argv)
+	}
+
+	// Run pre-connect local hooks
+	_ = runLocalHooks(r.EffectivePreConnect)
+
+	// Create pane and capture its id so we can enable per-host logging.
+	//
+	// IMPORTANT (interactive SSH):
+	// Do NOT run ssh under an extra `bash -lc` layer when launching panes/windows.
+	// That layer can break interactive input (TTY/line discipline) in some tmux environments.
+	//
+	// Instead:
+	// - Print the command for debugging
+	// - `exec` the ssh command directly so it becomes the pane's foreground process
+	// - If ssh exits non-zero, keep the pane open so the user can read output
+	keepOpenLine := "set +e\n" +
+		// Run ssh interactively. If it fails immediately, keep pane open with a minimal message.
+		"eval " + shellEscapeForSh(line) + "\n" +
+		"rc=$?\n" +
+		"if [ $rc -ne 0 ]; then\n" +
+		"  echo\n" +
+		"  echo 'tmux-ssh-manager: connect FAILED (exit='$rc')'\n" +
+		"  echo\n" +
+		"  echo 'Press Enter to close...'\n" +
+		"  read -r _\n" +
+		"fi\n" +
+		"exit $rc\n"
+	cmd := exec.Command("tmux", "split-window", "-h", "-P", "-F", "#{pane_id}", "-c", "#{pane_current_path}", "bash", "-lc", keepOpenLine)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	id := strings.TrimSpace(string(out))
+	if id != "" {
+		m.createdPaneIDs = append(m.createdPaneIDs, id)
+
+		// Track pane->host mapping for :send/:dash save.
+		if m.paneHost == nil {
+			m.paneHost = make(map[string]string)
+		}
+		m.paneHost[id] = strings.TrimSpace(r.Host.Name)
+
+		// Enable per-host daily logging for this pane using tmux pipe-pane.
+		_ = enableTmuxPipePaneLoggingForTarget(id, r.Host.Name)
+
+		// Delay after starting SSH before sending on_connect commands.
+		// Use effective per-host delay if configured; otherwise default to 500ms.
+		delayMS := r.EffectiveConnectDelayMS
+		if delayMS <= 0 {
+			delayMS = 500
+		}
+		time.Sleep(time.Duration(delayMS) * time.Millisecond)
+
+		// Send on_connect commands into the new pane after ssh starts
+		// and log them with copy/paste-friendly markers.
+		m.sendRecorded(r.Host.Name, id, r.EffectiveOnConnect)
+
+		// Run post-connect local hooks (best-effort: ssh may still be negotiating)
+		_ = runLocalHooks(r.EffectivePostConnect)
+	}
+	return id, nil
+}
+
+func (m *model) tmuxSplitV(r ResolvedHost) (string, error) {
+	// Build launch line.
+	//
+	// IMPORTANT:
+	// - For askpass: use the internal PTY connector (__connect) so Keychain automation works.
+	// - For manual/identity: run the real OpenSSH client directly (`command ssh ...`) to avoid
+	//   double tmux-wrapping / wrapper re-entry (especially when users alias ssh->tmux-ssh-manager ssh).
+	line := ""
+	if strings.EqualFold(strings.TrimSpace(m.effectiveLoginMode(r)), "askpass") {
+		bin := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_BIN"))
+		if bin == "" {
+			bin = "tmux-ssh-manager"
+		}
+		userFlag := ""
+		if strings.TrimSpace(r.EffectiveUser) != "" {
+			userFlag = " --user " + shellEscapeForSh(strings.TrimSpace(r.EffectiveUser))
+		}
+		line = shellEscapeForSh(bin) + " __connect --host " + shellEscapeForSh(strings.TrimSpace(r.Host.Name)) + userFlag
+	} else {
+		argv := BuildSSHCommand(r)
+		// Bypass any shell alias/function for ssh.
+		line = "command " + shellQuoteCmdSimple(argv)
+	}
+
+	// Run pre-connect local hooks
+	_ = runLocalHooks(r.EffectivePreConnect)
+
+	// Create pane and capture its id so we can enable per-host logging.
+	//
+	// IMPORTANT (interactive SSH):
+	// Avoid nested `bash -lc` execution for ssh; exec the command directly.
+	keepOpenLine := "set +e\n" +
+		// Run ssh interactively. If it fails immediately, keep pane open with a minimal message.
+		"eval " + shellEscapeForSh(line) + "\n" +
+		"rc=$?\n" +
+		"if [ $rc -ne 0 ]; then\n" +
+		"  echo\n" +
+		"  echo 'tmux-ssh-manager: connect FAILED (exit='$rc')'\n" +
+		"  echo\n" +
+		"  echo 'Press Enter to close...'\n" +
+		"  read -r _\n" +
+		"fi\n" +
+		"exit $rc\n"
+	cmd := exec.Command("tmux", "split-window", "-v", "-P", "-F", "#{pane_id}", "-c", "#{pane_current_path}", "bash", "-lc", keepOpenLine)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	id := strings.TrimSpace(string(out))
+	if id != "" {
+		m.createdPaneIDs = append(m.createdPaneIDs, id)
+
+		// Track pane->host mapping for :send/:dash save.
+		if m.paneHost == nil {
+			m.paneHost = make(map[string]string)
+		}
+		m.paneHost[id] = strings.TrimSpace(r.Host.Name)
+
+		// Enable per-host daily logging for this pane using tmux pipe-pane.
+		_ = enableTmuxPipePaneLoggingForTarget(id, r.Host.Name)
+
+		// Delay after starting SSH before sending on_connect commands.
+		// Use effective per-host delay if configured; otherwise default to 500ms.
+		delayMS := r.EffectiveConnectDelayMS
+		if delayMS <= 0 {
+			delayMS = 500
+		}
+		time.Sleep(time.Duration(delayMS) * time.Millisecond)
+
+		// Send on_connect commands into the new pane after ssh starts
+		// and log them with copy/paste-friendly markers.
+		m.sendRecorded(r.Host.Name, id, r.EffectiveOnConnect)
+
+		// Run post-connect local hooks (best-effort: ssh may still be negotiating)
+		_ = runLocalHooks(r.EffectivePostConnect)
+	}
+	return id, nil
+}
+
+func (m *model) tmuxNewWindow(r ResolvedHost) (string, error) {
+	// Build launch line.
+	//
+	// IMPORTANT:
+	// - For askpass: use the internal PTY connector (__connect) so Keychain automation works.
+	// - For manual/identity: run the real OpenSSH client directly (`command ssh ...`) to avoid
+	//   double tmux-wrapping / wrapper re-entry (especially when users alias ssh->tmux-ssh-manager ssh).
+	line := ""
+	if strings.EqualFold(strings.TrimSpace(m.effectiveLoginMode(r)), "askpass") {
+		bin := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_BIN"))
+		if bin == "" {
+			bin = "tmux-ssh-manager"
+		}
+		userFlag := ""
+		if strings.TrimSpace(r.EffectiveUser) != "" {
+			userFlag = " --user " + shellEscapeForSh(strings.TrimSpace(r.EffectiveUser))
+		}
+		line = shellEscapeForSh(bin) + " __connect --host " + shellEscapeForSh(strings.TrimSpace(r.Host.Name)) + userFlag
+	} else {
+		argv := BuildSSHCommand(r)
+		// Bypass any shell alias/function for ssh.
+		line = "command " + shellQuoteCmdSimple(argv)
+	}
+
+	// Run pre-connect local hooks
+	_ = runLocalHooks(r.EffectivePreConnect)
+
+	// Create window and capture its id so we can enable per-host logging.
+	//
+	// IMPORTANT (interactive SSH):
+	// Avoid nested `bash -lc` execution for ssh; exec the command directly.
+	keepOpenLine := "set +e\n" +
+		// Run ssh interactively. If it fails immediately, keep window open with a minimal message.
+		"eval " + shellEscapeForSh(line) + "\n" +
+		"rc=$?\n" +
+		"if [ $rc -ne 0 ]; then\n" +
+		"  echo\n" +
+		"  echo 'tmux-ssh-manager: connect FAILED (exit='$rc')'\n" +
+		"  echo\n" +
+		"  echo 'Press Enter to close...'\n" +
+		"  read -r _\n" +
+		"fi\n" +
+		"exit $rc\n"
+	cmd := exec.Command("tmux", "new-window", "-P", "-F", "#{window_id}", "-c", "#{pane_current_path}", "bash", "-lc", keepOpenLine)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	id := strings.TrimSpace(string(out))
+	if id == "" {
+		return "", nil
+	}
+	m.createdWindowIDs = append(m.createdWindowIDs, id)
+
+	// Find the pane in the new window so we can enable logging and send on_connect commands.
+	paneID := ""
+	panesOut, perr := exec.Command("tmux", "list-panes", "-t", id, "-F", "#{pane_id}").Output()
+	if perr == nil {
+		lines := strings.Split(strings.TrimSpace(string(panesOut)), "\n")
+		if len(lines) > 0 {
+			paneID = strings.TrimSpace(lines[0])
+		}
+	}
+	if paneID != "" {
+		// Track pane->host mapping for :send/:dash save.
+		if m.paneHost == nil {
+			m.paneHost = make(map[string]string)
+		}
+		m.paneHost[paneID] = strings.TrimSpace(r.Host.Name)
+
+		// Enable per-host daily logging for the new window's pane using tmux pipe-pane.
+		_ = enableTmuxPipePaneLoggingForTarget(paneID, r.Host.Name)
+
+		// Delay after starting SSH before sending on_connect commands.
+		// Use effective per-host delay if configured; otherwise default to 500ms.
+		delayMS := r.EffectiveConnectDelayMS
+		if delayMS <= 0 {
+			delayMS = 500
+		}
+		time.Sleep(time.Duration(delayMS) * time.Millisecond)
+
+		// Send on_connect commands and log them with copy/paste-friendly markers.
+		m.sendRecorded(r.Host.Name, paneID, r.EffectiveOnConnect)
+	}
+
+	// Run post-connect local hooks (best-effort: ssh may still be negotiating)
+	_ = runLocalHooks(r.EffectivePostConnect)
+
+	return paneID, nil
+}
+
+// effectiveLoginMode resolves the effective login mode for a host.
+//
+// Precedence (highest first):
+// 1) Per-host extras auth_mode (stored locally under ~/.config/tmux-ssh-manager/hosts/<host>.conf)
+//   - auth_mode=keychain -> askpass
+//   - auth_mode=manual   -> manual
+//
+// 2) YAML host login_mode (manual/askpass)
+//
+// This lets the TUI persist login behavior without rewriting the YAML.
+func (m *model) effectiveLoginMode(r ResolvedHost) string {
+	hostKey := strings.TrimSpace(r.Host.Name)
+	if hostKey != "" {
+		if ex, err := LoadHostExtras(hostKey); err == nil {
+			am := strings.ToLower(strings.TrimSpace(ex.AuthMode))
+			switch am {
+			case "keychain":
+				return "askpass"
+			case "manual":
+				return "manual"
+			}
+		}
+	}
+
+	lm := strings.ToLower(strings.TrimSpace(r.Host.LoginMode))
+	if lm == "" {
+		return "manual"
+	}
+	return lm
+}
+
+// (Askpass wrapper removed)
+//
+// The project previously attempted to use SSH_ASKPASS from within tmux splits/windows.
+// This proved brittle across environments (especially with keyboard-interactive prompts).
+//
+// We now prefer a PTY-mediated, expect-like connector via the internal `tmux-ssh-manager __connect`
+// helper, which runs ssh under a PTY and supplies the Keychain password when prompted.
+//
+// Keeping the old askpass wrapper/parsing code around is confusing and risks regressions,
+// so it has been removed.
+//
+// sanitizeLogLine removes control characters that make pipe-pane logs noisy when viewed.
+// We keep the raw log on disk; sanitization is applied at view time only.
+func sanitizeLogLine(s string) string {
+	// Normalize CRLF / carriage-return prompts so they don't show up as ^M.
+	s = strings.ReplaceAll(s, "\r", "")
+
+	// Strip ANSI escape sequences:
+	// - CSI: ESC [ ... letter
+	// - OSC: ESC ] ... BEL or ST
+	// - Charset select: ESC ( B  (and similar)
+	//
+	// This is intentionally simple and covers the common sequences seen in prompts.
+	out := make([]rune, 0, len(s))
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b { // ESC
+			// CSI
+			if i+1 < len(s) && s[i+1] == '[' {
+				i += 2
+				// Parameter bytes: 0x30-0x3f, Intermediate: 0x20-0x2f, Final: 0x40-0x7e
+				for i < len(s) {
+					b := s[i]
+					if b >= 0x40 && b <= 0x7e {
+						i++
+						break
+					}
+					i++
+				}
+				continue
+			}
+			// OSC
+			if i+1 < len(s) && s[i+1] == ']' {
+				i += 2
+				for i < len(s) {
+					if s[i] == 0x07 { // BEL
+						i++
+						break
+					}
+					// ST: ESC \
+					if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '\\' {
+						i += 2
+						break
+					}
+					i++
+				}
+				continue
+			}
+			// Charset select: ESC ( X
+			if i+2 < len(s) && s[i+1] == '(' {
+				i += 3
+				continue
+			}
+			// Unknown ESC sequence: skip ESC itself
+			i++
+			continue
+		}
+
+		// Drop other control chars except tab.
+		if s[i] < 0x20 && s[i] != '\t' {
+			i++
+			continue
+		}
+
+		out = append(out, rune(s[i]))
+		i++
+	}
+	return string(out)
+}
+
+// tmuxInstallMyKey launches an "install local public key to remote authorized_keys" workflow
+// in a new tmux window (preferred). If that fails, it falls back to a split pane.
+// If replace is true, it replaces authorized_keys (DANGEROUS) - should only be used after explicit confirmation.
+func (m *model) tmuxInstallMyKey(r ResolvedHost, replace bool) error {
+	// Pick a key: prefer per-host extras config if present; otherwise use best local default.
+	hostKey := strings.TrimSpace(r.Host.Name)
+	extras, _ := LoadHostExtras(hostKey)
+
+	mode := KeyInstallEnsure
+	if replace {
+		mode = KeyInstallReplace
+	} else if strings.EqualFold(strings.TrimSpace(extras.AuthorizedKeysMode), "replace") {
+		// Do not auto-replace just because config says so. Replacement must be explicitly requested.
+		mode = KeyInstallEnsure
+	}
+
+	var pub LocalPublicKey
+	var err error
+	if strings.TrimSpace(extras.KeyInstallPubKeyPath) != "" {
+		pub, err = ReadLocalPublicKey(extras.KeyInstallPubKeyPath)
+		if err != nil {
+			return err
+		}
+	} else {
+		// Default: Linux-oriented baseline key. Prefer ~/.ssh/id_rsa.pub unless explicitly overridden per host.
+		// If it's missing/unreadable, fall back to auto-detection.
+		pub, err = ReadLocalPublicKey("~/.ssh/id_rsa.pub")
+		if err != nil {
+			keys, derr := DetectLocalPublicKeys()
+			if derr != nil {
+				return derr
+			}
+			if len(keys) == 0 {
+				return fmt.Errorf("no local public keys found under ~/.ssh (expected id_rsa.pub)")
+			}
+			pub = keys[0]
+		}
+	}
+
+	// Determine connect strategy:
+	// - If keychain auth is enabled AND a credential is available, run the install non-interactively by using
+	//   OpenSSH with SSH_ASKPASS pointing at tmux-ssh-manager's internal __askpass helper.
+	//   This avoids the interactive PTY connector (__connect), so the install completes immediately (no "exit" needed).
+	// - Otherwise, fall back to plain ssh (you may be prompted).
+	loginMode := strings.ToLower(strings.TrimSpace(m.effectiveLoginMode(r)))
+	credOK := false
+	if loginMode == "askpass" {
+		if err := CredGet(hostKey, r.EffectiveUser, "password"); err == nil {
+			credOK = true
+		}
+	}
+
+	// Build the remote authorized_keys install script via the shared helper (avoid duplicating logic here).
+	remoteScript, err := BuildAuthorizedKeysInstallRemoteScript(pub, mode)
+	if err != nil {
+		return err
+	}
+	// Avoid: "sh: 0: -c requires an argument"
+	//
+	// Some environments/log wrappers can end up invoking `sh -c` without the script argument if quoting gets
+	// mangled across layers. To make this robust, execute the remote script via stdin:
+	//
+	//   ssh ... sh -s <<'EOF'
+	//   <script>
+	//   EOF
+	//
+	// NOTE: Do NOT insert a `--` separator before the remote command.
+	// macOS/OpenSSH treats `--` as an invalid option for ssh ("illegal option -- -").
+	remoteHeredoc := "sh -s <<'TSSM_EOF'\n" + remoteScript + "\nTSSM_EOF\n"
+
+	// Compute ssh destination + flags from resolved host (only when present / non-default):
+	// - Port: include only if non-default and >0
+	// - ProxyJump: include only if set
+	// - IdentityFile: include only if set (per-host extras or explicit override)
+	dest := strings.TrimSpace(r.Host.Name)
+	if strings.TrimSpace(r.EffectiveUser) != "" {
+		dest = strings.TrimSpace(r.EffectiveUser) + "@" + dest
+	}
+	if dest == "" {
+		return fmt.Errorf("key install: empty destination")
+	}
+
+	// Best-effort identity override: honor per-host extras identity_file when set.
+	identityFlag := ""
+	if ex, exErr := LoadHostExtras(hostKey); exErr == nil {
+		if id := strings.TrimSpace(ex.IdentityFile); id != "" {
+			id = expandPath(id)
+			if id != "" {
+				identityFlag = " -i " + shellEscapeForSh(id)
+			}
+		}
+	}
+
+	portFlag := ""
+	if r.EffectivePort > 0 && r.EffectivePort != 22 {
+		portFlag = " -p " + shellEscapeForSh(strconv.Itoa(r.EffectivePort))
+	}
+
+	jumpFlag := ""
+	if strings.TrimSpace(r.EffectiveJumpHost) != "" {
+		jumpFlag = " -J " + shellEscapeForSh(strings.TrimSpace(r.EffectiveJumpHost))
+	}
+
+	// This is the computed OpenSSH line (alias-proof when prefixed with `command` below).
+	//
+	// IMPORTANT:
+	// Do NOT prefix this with "command " at call sites by concatenating strings. "command" is a shell builtin,
+	// and writing "command ssh ..." is fine, but writing "command " + sshComputed becomes "command ssh ..."
+	// only if sshComputed begins with "ssh". Keep sshComputed starting with "ssh" and call sites should run:
+	//   command ssh ...
+	sshComputed := "ssh" + portFlag + jumpFlag + identityFlag + " " + shellEscapeForSh(dest) + " " + shellEscapeForSh(remoteHeredoc)
+
+	bin := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_BIN"))
+	if bin == "" {
+		bin = "tmux-ssh-manager"
+	}
+
+	// Human-friendly banner shown in the window before running the install.
+	modeLabel := "ensure"
+	if mode == KeyInstallReplace {
+		modeLabel = "replace"
+	}
+	explain := strings.Join([]string{
+		"set -e",
+		fmt.Sprintf("echo 'tmux-ssh-manager: key install (%s)'", modeLabel),
+		fmt.Sprintf("echo '  host: %s'", shellEscapeForSh(hostKey)),
+		fmt.Sprintf("echo '  user: %s'", shellEscapeForSh(strings.TrimSpace(r.EffectiveUser))),
+		fmt.Sprintf("echo '  pubkey: %s'", shellEscapeForSh(pub.Path)),
+		fmt.Sprintf("echo '  login_mode: %s'", shellEscapeForSh(loginMode)),
+		fmt.Sprintf("echo '  credential: %s'", shellEscapeForSh(func() string {
+			if credOK {
+				return "available"
+			}
+			return "missing/unknown"
+		}())),
+		"echo",
+		"echo 'What happens:'",
+		"echo '  - We connect to the host and run a remote script to update ~/.ssh/authorized_keys.'",
+		"echo '  - Mode ensure is idempotent: it appends the key only if missing.'",
+		"echo '  - If login_mode=askpass and a Keychain credential exists, we run the install non-interactively via SSH_ASKPASS (no manual exit required).'",
+		"echo",
+	}, "\n")
+
+	var cmdLine string
+	if loginMode == "askpass" && credOK {
+		// Non-interactive install using OpenSSH + SSH_ASKPASS.
+		//
+		// - We create a temp wrapper script so OpenSSH can exec SSH_ASKPASS reliably.
+		//   (This mirrors the scp wrapper approach.)
+		// - We must bypass user aliases/functions for ssh: use `command ssh`.
+		// - After successful install, automatically flip the host to identity-based auth by:
+		//   - setting identity_file=~/.ssh/id_rsa if not set
+		//   - setting auth_mode=manual (stop forcing keychain)
+		userFlag := ""
+		if strings.TrimSpace(r.EffectiveUser) != "" {
+			userFlag = " --user " + shellEscapeForSh(strings.TrimSpace(r.EffectiveUser))
+		}
+
+		cmdLine = explain + "\n" +
+			"TMPDIR=\"${TMPDIR:-/tmp}\"\n" +
+			"WRAP=\"$TMPDIR/tssm-askpass-$$.sh\"\n" +
+			"umask 077\n" +
+			"cat >\"$WRAP\" <<'EOF'\n" +
+			"#!/bin/sh\n" +
+			"exec " + shellEscapeForSh(bin) + " __askpass --host " + shellEscapeForSh(hostKey) + userFlag + " --kind password\n" +
+			"EOF\n" +
+			"chmod 700 \"$WRAP\"\n" +
+			"export SSH_ASKPASS=\"$WRAP\"\n" +
+			"export SSH_ASKPASS_REQUIRE=force\n" +
+			"export DISPLAY=1\n" +
+			"set +e\n" +
+			"command " + sshComputed + "\n" +
+			"rc=$?\n" +
+			"rm -f \"$WRAP\" >/dev/null 2>&1 || true\n" +
+			"set -e\n" +
+			"echo\n" +
+			"if [ $rc -eq 0 ]; then\n" +
+			"  echo 'SUCCESS: authorized_keys updated.'\n" +
+			"  echo 'Auto-switching this host to identity-based auth...'\n" +
+			"  # Persist identity_file default (if unset) and disable keychain forcing.\n" +
+			"  # Do NOT edit the conf file with grep/sed/perl here; delegate to the Go code path so\n" +
+			"  # normalization and file IO are consistent.\n" +
+			"  " + shellEscapeForSh(bin) + " __hostextras-switch-to-identity --host " + shellEscapeForSh(hostKey) + "\n" +
+			"  echo 'OK: auth_mode set to manual; identity_file ensured.'\n" +
+			"else\n" +
+			"  echo \"FAILED (exit=$rc)\"\n" +
+			"fi\n" +
+			"echo\n" +
+			"echo 'Press Enter to close...'\n" +
+			"read -r _\n" +
+			"exit $rc"
+	} else {
+		// Plain ssh path (may prompt).
+		//
+		// IMPORTANT:
+		// Users may alias `ssh` to `tmux-ssh-manager ssh`. When we truly want the OpenSSH client,
+		// bypass aliases/functions by using the shell builtin `command`:
+		//   command ssh ...
+		cmdLine = explain + "\n" +
+			"command " + sshComputed + "\n" +
+			"rc=$?; echo; if [ $rc -eq 0 ]; then echo 'SUCCESS: authorized_keys updated.'; else echo \"FAILED (exit=$rc)\"; fi; echo; echo 'Press Enter to close...'; read -r _; exit $rc"
+	}
+
+	// Prefer opening in a new tmux window so interactive prompts are clean.
+	// If new-window fails, fall back to split.
+	cmd := exec.Command("tmux", "new-window", "-c", "#{pane_current_path}", "bash", "-lc", cmdLine)
+	if err := cmd.Run(); err == nil {
+		return nil
+	}
+
+	// Fallback: split vertically
+	cmd2 := exec.Command("tmux", "split-window", "-v", "-c", "#{pane_current_path}", "bash", "-lc", cmdLine)
+	return cmd2.Run()
+}
+
+func (m model) tmuxYank(text string) error {
+	if err := exec.Command("tmux", "set-buffer", "--", text).Run(); err != nil {
+		return err
+	}
+	_ = exec.Command("tmux", "display-message", "-d", "1500", "Yanked SSH command to tmux buffer").Run()
+	return nil
+}
+
+func isDigitKey(k string) bool {
+	return len(k) == 1 && k[0] >= '0' && k[0] <= '9'
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func boolPtr(v bool) *bool { return &v }
+
+// shellQuoteCmdSimple quotes argv for a Bourne shell line.
+// This is a simple single-quote strategy suitable for command previews and tmux.
+func shellQuoteCmdSimple(argv []string) string {
+	isSpecial := func(r rune) bool {
+		switch r {
+		case ' ', '\t', '\n', '"', '\'', '\\', '$', '`', '&', '|', ';', '<', '>', '(', ')', '{', '}', '*', '?', '!', '~', '#':
+			return true
+		default:
+			return false
+		}
+	}
+	quoted := make([]string, 0, len(argv))
+	for _, a := range argv {
+		if a == "" {
+			quoted = append(quoted, "''")
+			continue
+		}
+		if strings.IndexFunc(a, isSpecial) >= 0 {
+			quoted = append(quoted, "'"+strings.ReplaceAll(a, "'", "'\"'\"'")+"'")
+		} else {
+			quoted = append(quoted, a)
+		}
+	}
+	return strings.Join(quoted, " ")
+}
+
+func sendOnConnectToPane(paneID string, cmds []string) {
+	if paneID == "" || len(cmds) == 0 {
+		return
+	}
+	for _, c := range cmds {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		_ = exec.Command("tmux", "send-keys", "-t", paneID, "--", c, "Enter").Run()
+	}
+}
+
+// sendOnConnectToPaneLogged sends commands to a tmux pane and also writes copy/paste-friendly
+// markers to the per-host daily log. Each marker begins on its own line and ends with a newline.
+//
+// Marker format:
+//
+//	>>> <command>
+//
+// Notes:
+//   - We do NOT include pane id to keep logs cleaner.
+//   - Only commands we send programmatically are logged (dashboards/on_connect), which avoids
+//     logging interactive user typing (and potential secrets).
+func sendOnConnectToPaneLogged(hostKey, paneID string, cmds []string) {
+	hostKey = strings.TrimSpace(hostKey)
+	if paneID == "" || len(cmds) == 0 {
+		return
+	}
+	for _, c := range cmds {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+
+		// Record commands explicitly into the host log (separate from SSH output).
+		_, _ = AppendHostLogLine(hostKey, time.Now(), DefaultLogOptions(), ">>> "+c)
+
+		_ = exec.Command("tmux", "send-keys", "-t", paneID, "--", c, "Enter").Run()
+	}
+}
+
+// sendRecorded wraps sendOnConnectToPaneLogged and, if recording is enabled,
+// records the (host, command list) mapping keyed by pane id.
+// Note: this only captures commands that tmux-ssh-manager itself sends.
+// It does not (and cannot) capture arbitrary keystrokes typed inside SSH.
+func (m *model) sendRecorded(hostKey, paneID string, cmds []string) {
+	// Always send to pane first (best-effort).
+	sendOnConnectToPaneLogged(hostKey, paneID, cmds)
+
+	if m == nil || !m.recording {
+		return
+	}
+	hostKey = strings.TrimSpace(hostKey)
+	paneID = strings.TrimSpace(paneID)
+	if hostKey == "" || paneID == "" || len(cmds) == 0 {
+		return
+	}
+	if m.recordedPanes == nil {
+		m.recordedPanes = make(map[string]*RecordedPane)
+	}
+
+	rp := m.recordedPanes[paneID]
+	if rp == nil {
+		rp = &RecordedPane{Host: hostKey}
+		m.recordedPanes[paneID] = rp
+	} else if strings.TrimSpace(rp.Host) == "" {
+		rp.Host = hostKey
+	}
+
+	for _, c := range cmds {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		rp.Commands = append(rp.Commands, c)
+	}
+}
+
+// runLocalHooks executes a list of local shell commands (pre/post-connect hooks).
+// Commands run via "bash -lc" to honor shell configuration and PATH.
+func runLocalHooks(cmds []string) error {
+	if len(cmds) == 0 {
+		return nil
+	}
+	for _, c := range cmds {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		if err := exec.Command("bash", "-lc", c).Run(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// enableTmuxPipePaneLoggingForTarget enables per-host daily logging for a specific tmux pane.
+// It appends to the per-host daily log file:
+//
+//	~/.config/tmux-ssh-manager/logs/<hostkey>/YYYY-MM-DD.log
+//
+// This uses `tmux pipe-pane -t <pane_id> -o "<cmd>"` so it does not break the interactive TTY.
+//
+// Important notes:
+//   - tmux expects the pipe command as a single argument string.
+//   - Avoid extra shell layers ("sh -lc ...") to reduce quoting/parsing issues.
+//   - Avoid quoting the log path inside the pipe command; we control the path and it should not
+//     contain spaces. (Host keys are sanitized; base dir is stable.)
+//   - After enabling pipe-pane, emit a test marker into the pane using tmux display-message.
+//     If that marker does not show up in the log file, logging is not actually working.
+//
+// Best-effort: callers may ignore errors, but this function records failures to the host log.
+func enableTmuxPipePaneLoggingForTarget(paneID, hostKey string) error {
+	paneID = strings.TrimSpace(paneID)
+	hostKey = strings.TrimSpace(hostKey)
+	if paneID == "" || hostKey == "" {
+		return nil
+	}
+
+	opts := DefaultLogOptions()
+
+	// Ensure log exists and get path
+	info, err := EnsureDailyHostLog(hostKey, time.Now(), opts)
+	if err != nil {
+		return err
+	}
+
+	// Use socket-aware tmux wrapper to avoid client/server context mismatches (e.g., popups).
+	if err := EnablePipePaneAppend(paneID, info.Path); err != nil {
+		_, _ = AppendHostLogLine(hostKey, time.Now(), opts,
+			fmt.Sprintf("log: failed to enable tmux pipe-pane for pane %s: %v", paneID, err))
+		return err
+	}
+
+	// Verify best-effort and record state.
+	if on, pipePath, vErr := VerifyPipePane(paneID); vErr == nil {
+		if !on {
+			_, _ = AppendHostLogLine(hostKey, time.Now(), opts,
+				fmt.Sprintf("log: pipe-pane verify failed for pane %s (pane_pipe=0)", paneID))
+		} else {
+			if pipePath != "" {
+				_, _ = AppendHostLogLine(hostKey, time.Now(), opts,
+					fmt.Sprintf("log: pipe-pane verify ok for pane %s (path=%s)", paneID, pipePath))
+			}
+		}
+	}
+
+	_, _ = AppendHostLogLine(hostKey, time.Now(), opts,
+		fmt.Sprintf("log: enabled tmux pipe-pane for pane %s -> %s", paneID, info.Path))
+	return nil
+}
+
+// shellEscapeForSh escapes a string for safe use in a shell command line.
+// This is a minimal single-quote escape strategy.
+// Example: /tmp/foo'bar -> '/tmp/foo'"'"'bar'
+func shellEscapeForSh(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if strings.IndexByte(s, '\'') < 0 {
+		return "'" + s + "'"
+	}
+	// Close/open quotes around single quotes: 'foo'"'"'bar'
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+// sanitizeNameForSession converts a user-facing name into a tmux-safe session identifier.
+// Keep it consistent with tmux-session-manager's exporter sanitizer (lowercase, [_a-z0-9], underscores).
+func sanitizeNameForSession(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ToLower(s)
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	lastUnderscore := false
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+			lastUnderscore = false
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+			lastUnderscore = false
+		case r == '-' || r == '_':
+			b.WriteRune('_')
+			lastUnderscore = true
+		default:
+			if !lastUnderscore {
+				b.WriteRune('_')
+				lastUnderscore = true
+			}
+		}
+	}
+	out := strings.Trim(b.String(), "_")
+	if out == "" {
+		return "session"
+	}
+	return out
+}
+
+// --- Logs viewer ---
+//
+// The logs viewer reads per-host daily logs stored under:
+//
+//	~/.config/tmux-ssh-manager/logs/<hostkey>/YYYY-MM-DD.log
+//
+// Keybindings (vim-ish):
+// - q / Esc: close logs view
+// - j/k: down/up one line
+// - d/u: half-page down/up
+// - gg: top, G: bottom
+// - J/K: next/prev log file (by date, newest first)
+// - r: reload current view window
+func (m *model) openLogs(hostKey string) error {
+	hostKey = strings.TrimSpace(hostKey)
+	if hostKey == "" {
+		return fmt.Errorf("empty host key")
+	}
+
+	// Determine today's log file path (created if missing).
+	// We compute the default path here rather than depending on other packages.
+	base := os.Getenv("XDG_CONFIG_HOME")
+	if strings.TrimSpace(base) == "" {
+		home, _ := os.UserHomeDir()
+		base = filepath.Join(home, ".config")
+	}
+	logDir := filepath.Join(base, "tmux-ssh-manager", "logs", sanitizeHostKeyToFilename(hostKey))
+	_ = os.MkdirAll(logDir, 0o700)
+
+	today := time.Now().Format("2006-01-02")
+	todayPath := filepath.Join(logDir, today+".log")
+	// Touch file so it's always readable
+	if f, err := os.OpenFile(todayPath, os.O_CREATE, 0o600); err == nil {
+		_ = f.Close()
+	}
+
+	// Collect log files (newest first by filename)
+	entries, _ := os.ReadDir(logDir)
+	files := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasSuffix(name, ".log") {
+			files = append(files, filepath.Join(logDir, name))
+		}
+	}
+	// Ensure today's file is included
+	foundToday := false
+	for _, p := range files {
+		if filepath.Clean(p) == filepath.Clean(todayPath) {
+			foundToday = true
+			break
+		}
+	}
+	if !foundToday {
+		files = append(files, todayPath)
+	}
+	sort.Slice(files, func(i, j int) bool {
+		ai := filepath.Base(files[i])
+		aj := filepath.Base(files[j])
+		return ai > aj
+	})
+
+	m.logHostKey = hostKey
+	m.logFiles = files
+	m.logSelected = 0
+	m.logFilePath = files[0]
+	m.logStartLine = 0
+	return m.reloadLogsWindow()
+}
+
+func (m *model) reloadLogsWindow() error {
+	if strings.TrimSpace(m.logFilePath) == "" {
+		m.logLines = nil
+		m.logTotalLines = 0
+		return nil
+	}
+
+	// Determine window size (leave room for header/footer)
+	h := m.height
+	if h <= 0 {
+		h = 24
+	}
+	// header(3) + footer(2) slack
+	page := h - 5
+	if page < 5 {
+		page = 5
+	}
+
+	lines, total, err := ReadLogWindow(m.logFilePath, m.logStartLine, page)
+	if err != nil {
+		return err
+	}
+
+	// Sanitize for in-TUI viewing so control sequences don't clutter the display.
+	for i := range lines {
+		lines[i] = sanitizeLogLine(lines[i])
+	}
+
+	m.logLines = lines
+	m.logTotalLines = total
+	return nil
+}
+
+func (m *model) viewLogs() string {
+	var b strings.Builder
+
+	// Header
+	host := m.logHostKey
+	file := filepath.Base(m.logFilePath)
+	b.WriteString(fmt.Sprintf("Logs: %s  (%s)\n", host, file))
+	b.WriteString("j/k line  d/u half-page  gg/G top/bot  J/K file  r reload  q close\n")
+	b.WriteString(strings.Repeat("-", maxInt(10, m.width)) + "\n")
+
+	// Body
+	for _, ln := range m.logLines {
+		b.WriteString(ln)
+		b.WriteString("\n")
+	}
+	if len(m.logLines) == 0 {
+		b.WriteString("(no log lines)\n")
+	}
+
+	// Footer
+	b.WriteString("\n")
+	b.WriteString(fmt.Sprintf("File %d/%d  StartLine=%d  TotalLines~%d\n",
+		m.logSelected+1, maxInt(1, len(m.logFiles)), m.logStartLine, m.logTotalLines))
+
+	return b.String()
+}
+
+// handleLogsKeys processes keypresses when logs viewer is active.
+// Returns (handled=true) if it consumed the key.
+func (m *model) handleLogsKeys(k tea.KeyMsg) (handled bool, out *model, cmd tea.Cmd) {
+	key := k.String()
+
+	switch key {
+	case "enter":
+		// In logs viewer, Enter should never fall through to connect.
+		// Treat it as "close logs and return to host list".
+		m.showLogs = false
+		m.logHostKey = ""
+		m.logFilePath = ""
+		m.logFiles = nil
+		m.logSelected = 0
+		m.logStartLine = 0
+		m.logLines = nil
+		m.logTotalLines = 0
+		return true, m, nil
+	case "q", "esc":
+		m.showLogs = false
+		m.logHostKey = ""
+		m.logFilePath = ""
+		m.logFiles = nil
+		m.logSelected = 0
+		m.logStartLine = 0
+		m.logLines = nil
+		m.logTotalLines = 0
+		return true, m, nil
+	case "r":
+		_ = m.reloadLogsWindow()
+		return true, m, nil
+	case "j", "down":
+		m.logStartLine++
+		_ = m.reloadLogsWindow()
+		return true, m, nil
+	case "k", "up":
+		if m.logStartLine > 0 {
+			m.logStartLine--
+		}
+		_ = m.reloadLogsWindow()
+		return true, m, nil
+	case "d", "pgdown":
+		// half page down
+		step := maxInt(1, (m.height-5)/2)
+		m.logStartLine += step
+		_ = m.reloadLogsWindow()
+		return true, m, nil
+	case "u", "pgup":
+		step := maxInt(1, (m.height-5)/2)
+		m.logStartLine -= step
+		if m.logStartLine < 0 {
+			m.logStartLine = 0
+		}
+		_ = m.reloadLogsWindow()
+		return true, m, nil
+	case "G":
+		// crude bottom: jump near end
+		if m.logTotalLines > 0 {
+			m.logStartLine = maxInt(0, m.logTotalLines-(m.height-5))
+		}
+		_ = m.reloadLogsWindow()
+		return true, m, nil
+	case "g":
+		// support gg
+		// defer to Update loop pendingG behavior: here we just handle a single 'g' by toggling pendingG
+		// (we reuse existing pendingG in model)
+		if m.pendingG {
+			m.pendingG = false
+			m.logStartLine = 0
+			_ = m.reloadLogsWindow()
+		} else {
+			m.pendingG = true
+		}
+		return true, m, nil
+	case "J":
+		// next file (older)
+		if len(m.logFiles) > 0 && m.logSelected < len(m.logFiles)-1 {
+			m.logSelected++
+			m.logFilePath = m.logFiles[m.logSelected]
+			m.logStartLine = 0
+			_ = m.reloadLogsWindow()
+		}
+		return true, m, nil
+	case "K":
+		// prev file (newer)
+		if len(m.logFiles) > 0 && m.logSelected > 0 {
+			m.logSelected--
+			m.logFilePath = m.logFiles[m.logSelected]
+			m.logStartLine = 0
+			_ = m.reloadLogsWindow()
+		}
+		return true, m, nil
+	}
+
+	// Any other key: no-op
+	return false, m, nil
+}
