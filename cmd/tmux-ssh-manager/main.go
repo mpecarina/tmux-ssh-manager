@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -834,12 +835,46 @@ func runConnectSubcommand(args []string) error {
 	}
 
 	// Start ssh under a PTY so we can detect prompts and inject the password.
+	//
+	// IMPORTANT:
+	// If we don't explicitly propagate the current terminal window size into the PTY,
+	// some environments (notably when invoked via wrappers/aliases/tmux) can end up with
+	// a 0x0 PTY size on the remote side (rows 0; columns 0), which breaks full-screen apps.
 	cmd := exec.Command(argv[0], argv[1:]...)
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		return fmt.Errorf("__connect: pty start: %w", err)
 	}
 	defer func() { _ = ptmx.Close() }()
+
+	// Seed PTY size from our current stdout terminal (best-effort).
+	// (stdout is what the user is actually looking at; stdin might not be a tty in some setups)
+	if term.IsTerminal(int(os.Stdout.Fd())) {
+		if cols, rows, sizeErr := term.GetSize(int(os.Stdout.Fd())); sizeErr == nil && rows > 0 && cols > 0 {
+			_ = pty.Setsize(ptmx, &pty.Winsize{
+				Rows: uint16(rows),
+				Cols: uint16(cols),
+			})
+		}
+	}
+
+	// Keep PTY size updated on window resize (SIGWINCH), best-effort.
+	// This ensures remote stays in sync as the local iTerm2 window changes size.
+	winchCh := make(chan os.Signal, 1)
+	signal.Notify(winchCh, syscall.SIGWINCH)
+	defer signal.Stop(winchCh)
+	go func() {
+		for range winchCh {
+			if term.IsTerminal(int(os.Stdout.Fd())) {
+				if cols, rows, sizeErr := term.GetSize(int(os.Stdout.Fd())); sizeErr == nil && rows > 0 && cols > 0 {
+					_ = pty.Setsize(ptmx, &pty.Winsize{
+						Rows: uint16(rows),
+						Cols: uint16(cols),
+					})
+				}
+			}
+		}
+	}()
 
 	// Disable local terminal echo so anything the user types (including password) isn't echoed locally.
 	// This does NOT prevent the remote from echoing; it prevents local tty echo.
