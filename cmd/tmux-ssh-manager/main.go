@@ -277,28 +277,33 @@ func main() {
 	if cfgErr != nil {
 		// If direct-connect mode is requested, allow running without config.
 		if flagHost == "" && !flagList && !flagPrintConfig {
-			// TUI mode without a source is not useful; provide guidance.
-			if strings.EqualFold(flagTUISource, "ssh") {
-				fmt.Fprintf(os.Stderr, "tmux-ssh-manager: failed to load SSH config for TUI: %v\n", cfgErr)
+			// If YAML config is missing, implicitly fall back to SSH-alias sourced TUI.
+			// This makes `tmux-ssh-manager` runnable from a normal shell without requiring hosts.yaml.
+			if !strings.EqualFold(flagTUISource, "ssh") {
+				flagTUISource = "ssh"
+			}
+			conf, err := manager.LoadConfigFromSSH(sshPaths...)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "tmux-ssh-manager: failed to load SSH config for TUI: %v\n", err)
 				if len(sshPaths) > 0 {
 					fmt.Fprintf(os.Stderr, "Checked SSH config paths: %s\n", strings.Join(sshPaths, ", "))
 				} else {
 					fmt.Fprintf(os.Stderr, "Checked default SSH config path: ~/.ssh/config (and included files)\n")
 				}
-			} else {
-				candidates := manager.ConfigPathCandidates(flagConfig)
-				fmt.Fprintf(os.Stderr, "tmux-ssh-manager: YAML configuration not found.\n")
-				fmt.Fprintf(os.Stderr, "Searched (in order):\n")
-				for _, c := range candidates {
-					fmt.Fprintf(os.Stderr, "  - %s\n", c)
-				}
-				fmt.Fprintf(os.Stderr, "\nCreate a config at ~/.config/tmux-ssh-manager/hosts.yaml (see README) and try again.\n")
+				os.Exit(1)
 			}
-			os.Exit(1)
+			cfg = conf
+			if len(sshPaths) > 0 {
+				cfgPath = strings.Join(sshPaths, ", ")
+			} else {
+				cfgPath = "~/.ssh/config"
+			}
+			cfgErr = nil
+		} else {
+			// In direct or list/print mode we can proceed with limited behavior.
+			cfg = nil
+			cfgPath = ""
 		}
-		// In direct or list/print mode we can proceed with limited behavior.
-		cfg = nil
-		cfgPath = ""
 	}
 
 	if flagPrintConfig {
