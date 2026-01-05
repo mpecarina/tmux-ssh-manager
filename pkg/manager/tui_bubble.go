@@ -527,6 +527,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "esc", "q":
 				m.showAddSSHHost = false
 				m.addSSHFieldSel = 0
+				m.pendingG = false
+				m.numBuf = ""
 				m.addSSHAlias.Blur()
 				m.addSSHHostName.Blur()
 				m.addSSHUser.Blur()
@@ -535,7 +537,55 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.addSSHIdentityFile.Blur()
 				m.setStatus("add host: cancelled", 1200)
 				return m, tea.ClearScreen
+
+			case "0":
+				// Vim-ish: 0 goes to top (Alias).
+				m.addSSHFieldSel = 0
+				m.pendingG = false
+				m.numBuf = ""
+				return m, nil
+
+			case "g":
+				// Vim-ish: gg to top
+				if m.pendingG {
+					m.addSSHFieldSel = 0
+					m.pendingG = false
+					m.numBuf = ""
+					return m, nil
+				}
+				m.pendingG = true
+				m.numBuf = ""
+				return m, nil
+
+			case "G":
+				// Vim-ish: G to bottom (IdentityFile)
+				m.addSSHFieldSel = 6
+				m.pendingG = false
+				m.numBuf = ""
+				return m, nil
+
+			case "1", "2", "3", "4", "5", "6", "7":
+				// Numeric jump to a field (rows shown are 1-based in UI here):
+				// 1 Alias, 2 HostName, 3 User, 4 Port, 5 ProxyJump, 6 ForwardAgent, 7 IdentityFile.
+				m.pendingG = false
+				m.numBuf = m.numBuf + msg.String()
+				return m, nil
+
 			case "tab", "enter":
+				// If a numeric field selection was typed (e.g. "6" then Enter), jump to that row.
+				if strings.TrimSpace(m.numBuf) != "" {
+					if n, err := strconv.Atoi(strings.TrimSpace(m.numBuf)); err == nil {
+						if n >= 1 && n <= 7 {
+							m.addSSHFieldSel = n - 1
+						} else {
+							m.setStatus("add host: invalid field number (use 1-7)", 2500)
+						}
+					}
+					m.numBuf = ""
+					m.pendingG = false
+					return m, nil
+				}
+
 				// Enter on last field triggers save; otherwise advances.
 				if m.addSSHFieldSel < 6 {
 					m.addSSHFieldSel++
@@ -574,6 +624,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Close modal + refresh
 					m.showAddSSHHost = false
 					m.addSSHFieldSel = 0
+					m.pendingG = false
+					m.numBuf = ""
 					m.addSSHAlias.SetValue("")
 					m.addSSHHostName.SetValue("")
 					m.addSSHUser.SetValue("")
@@ -602,17 +654,43 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.setStatus(fmt.Sprintf("added host: %s", alias), 2500)
 					return m, tea.ClearScreen
 				}
+
 			case "shift+tab":
+				m.pendingG = false
+				m.numBuf = ""
 				if m.addSSHFieldSel > 0 {
 					m.addSSHFieldSel--
 				}
 				return m, nil
+
+			case "j", "down":
+				// Uniform vim-ish navigation for this modal: j/k move between fields.
+				m.pendingG = false
+				m.numBuf = ""
+				if m.addSSHFieldSel < 6 {
+					m.addSSHFieldSel++
+				}
+				return m, nil
+
+			case "k", "up":
+				m.pendingG = false
+				m.numBuf = ""
+				if m.addSSHFieldSel > 0 {
+					m.addSSHFieldSel--
+				}
+				return m, nil
+
 			case " ":
 				// Space toggles ForwardAgent when focused on that row.
+				m.pendingG = false
+				m.numBuf = ""
 				if m.addSSHFieldSel == 5 {
 					m.addSSHForwardAgent = !m.addSSHForwardAgent
 					return m, nil
 				}
+			default:
+				// Any other key cancels a pending "g" sequence.
+				m.pendingG = false
 			}
 
 			// Focus management + let focused input update.
@@ -666,20 +744,74 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "esc", "q":
 				m.showHostSettings = false
 				m.pendingG = false
+				m.numBuf = ""
 				m.input.Blur()
 				m.recomputeFilter()
 				return m, tea.ClearScreen
+
+			case "0":
+				// Vim-ish: 0 goes to top (not a numeric selection here).
+				m.hostSettingsSel = 0
+				m.numBuf = ""
+				return m, nil
+
+			case "g":
+				// Vim-ish: gg to top
+				if m.pendingG {
+					m.hostSettingsSel = 0
+					m.pendingG = false
+					m.numBuf = ""
+					return m, nil
+				}
+				m.pendingG = true
+				m.numBuf = ""
+				return m, nil
+
+			case "G":
+				// Vim-ish: G to bottom
+				m.hostSettingsSel = 5
+				m.pendingG = false
+				m.numBuf = ""
+				return m, nil
+
 			case "j", "down":
+				m.pendingG = false
+				m.numBuf = ""
 				if m.hostSettingsSel < 5 {
 					m.hostSettingsSel++
 				}
 				return m, nil
+
 			case "k", "up":
+				m.pendingG = false
+				m.numBuf = ""
 				if m.hostSettingsSel > 0 {
 					m.hostSettingsSel--
 				}
 				return m, nil
+
+			case "1", "2", "3", "4", "5", "6", "7", "8", "9":
+				// Numeric selection (menu items are 1-based in UI).
+				// We only support 1-9 here (small menu). 0 is reserved for "go to top".
+				m.pendingG = false
+				m.numBuf = m.numBuf + msg.String()
+				return m, nil
+
 			case "enter":
+				// If a numeric menu selection was typed (e.g. "6" then Enter), apply it.
+				if strings.TrimSpace(m.numBuf) != "" {
+					if n, err := strconv.Atoi(strings.TrimSpace(m.numBuf)); err == nil {
+						if n >= 1 && n <= 6 {
+							m.hostSettingsSel = n - 1
+						} else {
+							m.setStatus("host settings: invalid selection", 2000)
+							m.numBuf = ""
+							return m, nil
+						}
+					}
+					m.numBuf = ""
+				}
+
 				// 0: Login mode toggle
 				// 1: Credential set
 				// 2: Credential delete
@@ -694,6 +826,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Close Host Settings when opening the Add SSH Host modal; otherwise the Host Settings
 					// overlay will continue to render and the new modal will appear "frozen"/hidden.
 					m.showHostSettings = false
+					m.pendingG = false
 
 					// Add SSH Host (append to ~/.ssh/config). Defaults ForwardAgent=yes.
 					m.showAddSSHHost = true
@@ -2659,7 +2792,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
-			// Connect in new tmux window(s) by default.
+			// If we're not in tmux, connect inline in the current terminal.
+			//
+			// Outside tmux, multi-select is disallowed because we can't create additional panes/windows.
+			if strings.TrimSpace(os.Getenv("TMUX")) == "" {
+				if len(targets) != 1 {
+					m.setStatus("Multi-select connect requires tmux (panes/windows). Start tmux or select a single host.", 3500)
+					return m, nil
+				}
+				r := targets[0]
+				m.addRecent(r.Host.Name)
+				m.saveState()
+				return m.connectOrQuit(r)
+			}
+
+			// In tmux: connect in new tmux window(s) by default.
 			// If new-window fails for any reason, fall back to a vertical split for that target.
 			failed := 0
 			for _, r := range targets {
@@ -3313,7 +3460,11 @@ func (m model) View() string {
 			b.WriteString("Tip: choose 'Add SSH Host' to create ~/.ssh/config and add your first entry.\n")
 		}
 
-		b.WriteString("\nKeys: j/k move • Enter apply • Esc/q close\n")
+		numHint := ""
+		if strings.TrimSpace(m.numBuf) != "" {
+			numHint = fmt.Sprintf(" • Num: %s", m.numBuf)
+		}
+		b.WriteString("\nKeys: j/k move • gg/G top/bot • 1-6 then Enter select • Enter apply • Esc/q close" + numHint + "\n")
 		return b.String()
 	}
 
@@ -3345,7 +3496,11 @@ func (m model) View() string {
 		b.WriteString("  - HostName will be written (defaults to Alias) so it is visible/searchable like Host.\n")
 		b.WriteString("  - ForwardAgent defaults to yes.\n")
 		b.WriteString("  - A ~/.ssh/config.bak backup will be written.\n")
-		b.WriteString("\nKeys: Enter/Tab next • Shift+Tab prev • Space toggle (ForwardAgent) • Esc cancel\n")
+		numHint := ""
+		if strings.TrimSpace(m.numBuf) != "" {
+			numHint = fmt.Sprintf(" • Num: %s", m.numBuf)
+		}
+		b.WriteString("\nKeys: j/k move • gg/G top/bot • 1-7 then Enter jump • Enter/Tab next • Shift+Tab prev • Space toggle (ForwardAgent) • Esc cancel" + numHint + "\n")
 		return b.String()
 	}
 
