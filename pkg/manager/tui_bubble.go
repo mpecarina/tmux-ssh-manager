@@ -82,6 +82,26 @@ type model struct {
 	showHostSettings bool
 	hostSettingsSel  int
 
+	// SSH config duplicates (primary ~/.ssh/config only)
+	dupAliasCount map[string]int // alias -> number of Host blocks in ~/.ssh/config
+
+	// Merge-duplicates confirmation modal (for ~/.ssh/config primary only)
+	showMergeDupsConfirm bool
+	mergeDupsAlias       string
+	mergeDupsCount       int
+	mergeDupsConfirmHint string
+
+	// Add SSH Host modal (writes to primary ~/.ssh/config)
+	showAddSSHHost     bool
+	addSSHFieldSel     int
+	addSSHAlias        textinput.Model
+	addSSHHostName     textinput.Model
+	addSSHUser         textinput.Model
+	addSSHPort         textinput.Model
+	addSSHProxyJump    textinput.Model
+	addSSHIdentityFile textinput.Model
+	addSSHForwardAgent bool // default true
+
 	status string
 
 	// --- Logs viewer state ---
@@ -156,6 +176,37 @@ func newModel(cfg *Config, opts UIOptions) model {
 	ci.Cursor.Style = ci.Cursor.Style.Bold(true)
 	ci.PromptStyle = ci.PromptStyle.Bold(true)
 
+	// Add SSH Host form inputs (primary ~/.ssh/config)
+	ai := textinput.New()
+	ai.Prompt = "Alias: "
+	ai.Placeholder = "e.g. narrs-dev1.lmig.com"
+	ai.CharLimit = 256
+
+	hni := textinput.New()
+	hni.Prompt = "HostName: "
+	hni.Placeholder = "default: same as Alias"
+	hni.CharLimit = 256
+
+	ui := textinput.New()
+	ui.Prompt = "User: "
+	ui.Placeholder = "optional"
+	ui.CharLimit = 128
+
+	pi := textinput.New()
+	pi.Prompt = "Port: "
+	pi.Placeholder = "optional (default 22)"
+	pi.CharLimit = 16
+
+	pji := textinput.New()
+	pji.Prompt = "ProxyJump: "
+	pji.Placeholder = "optional (bastion or jump host)"
+	pji.CharLimit = 256
+
+	idi := textinput.New()
+	idi.Prompt = "IdentityFile: "
+	idi.Placeholder = "optional (e.g. ~/.ssh/id_rsa)"
+	idi.CharLimit = 512
+
 	cands := buildCandidates(cfg)
 	m := model{
 		cfg:             cfg,
@@ -181,6 +232,20 @@ func newModel(cfg *Config, opts UIOptions) model {
 		filterFavorites: false,
 		filterRecents:   false,
 		selectedSet:     make(map[int]struct{}),
+
+		// SSH config duplicate map
+		dupAliasCount: make(map[string]int),
+
+		// Add SSH Host modal defaults
+		showAddSSHHost:     false,
+		addSSHFieldSel:     0,
+		addSSHAlias:        ai,
+		addSSHHostName:     hni,
+		addSSHUser:         ui,
+		addSSHPort:         pi,
+		addSSHProxyJump:    pji,
+		addSSHIdentityFile: idi,
+		addSSHForwardAgent: true,
 
 		// recorder defaults
 		recording:            false,
@@ -209,6 +274,18 @@ func newModel(cfg *Config, opts UIOptions) model {
 			m.recents = append([]string(nil), st.Recents...)
 		}
 	}
+	// Best-effort: compute duplicates in primary ~/.ssh/config (for marker + merge hotkey).
+	// This is intentionally non-fatal (the TUI should still work even if ~/.ssh/config is unreadable).
+	if rep, err := ComputePrimaryDuplicateAliases(); err == nil && rep != nil && rep.AliasToBlocks != nil {
+		for alias, blocks := range rep.AliasToBlocks {
+			alias = strings.TrimSpace(alias)
+			if alias == "" {
+				continue
+			}
+			m.dupAliasCount[alias] = len(blocks)
+		}
+	}
+
 	m.theme = LoadTheme("")
 	return m
 }
@@ -377,6 +454,212 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// Merge duplicates confirmation modal has highest priority (modal).
+		if m.showMergeDupsConfirm {
+			switch msg.String() {
+			case "esc", "n", "N", "q":
+				m.showMergeDupsConfirm = false
+				m.mergeDupsAlias = ""
+				m.mergeDupsCount = 0
+				m.mergeDupsConfirmHint = ""
+				m.pendingG = false
+				m.input.Blur()
+				m.recomputeFilter()
+				return m, tea.ClearScreen
+
+			case "y", "Y":
+				alias := strings.TrimSpace(m.mergeDupsAlias)
+				if alias == "" {
+					m.setStatus("merge: empty alias", 1500)
+					m.showMergeDupsConfirm = false
+					return m, tea.ClearScreen
+				}
+
+				changed, err := MergePrimaryDuplicateAlias(alias)
+				if err != nil {
+					m.setStatus(fmt.Sprintf("merge failed: %v", err), 4000)
+					m.showMergeDupsConfirm = false
+					return m, tea.ClearScreen
+				}
+				if !changed {
+					m.setStatus("merge: nothing to do", 1500)
+					m.showMergeDupsConfirm = false
+					return m, tea.ClearScreen
+				}
+
+				removed := 0
+				if m.mergeDupsCount > 1 {
+					removed = m.mergeDupsCount - 1
+				}
+				m.setStatus(fmt.Sprintf("merged duplicates for %s (kept first, removed %d)", alias, removed), 3000)
+				m.showMergeDupsConfirm = false
+				m.mergeDupsAlias = ""
+				m.mergeDupsCount = 0
+				m.mergeDupsConfirmHint = ""
+
+				// Refresh duplicate map (best-effort).
+				if rep, err := ComputePrimaryDuplicateAliases(); err == nil && rep != nil && rep.AliasToBlocks != nil {
+					m.dupAliasCount = make(map[string]int)
+					for a, blocks := range rep.AliasToBlocks {
+						a = strings.TrimSpace(a)
+						if a == "" {
+							continue
+						}
+						m.dupAliasCount[a] = len(blocks)
+					}
+				}
+
+				// Rebuild config from SSH aliases so list reflects any last-wins changes immediately.
+				if conf, err := LoadConfigFromSSH(); err == nil && conf != nil {
+					m.cfg = conf
+					m.candidates = buildCandidates(conf)
+					m.recomputeFilter()
+				}
+				return m, tea.ClearScreen
+			default:
+				return m, nil
+			}
+		}
+
+		// Add SSH Host modal (primary ~/.ssh/config): highest priority within normal UI (after global keys).
+		if m.showAddSSHHost {
+			switch msg.String() {
+			case "esc", "q":
+				m.showAddSSHHost = false
+				m.addSSHFieldSel = 0
+				m.addSSHAlias.Blur()
+				m.addSSHHostName.Blur()
+				m.addSSHUser.Blur()
+				m.addSSHPort.Blur()
+				m.addSSHProxyJump.Blur()
+				m.addSSHIdentityFile.Blur()
+				m.setStatus("add host: cancelled", 1200)
+				return m, tea.ClearScreen
+			case "tab", "enter":
+				// Enter on last field triggers save; otherwise advances.
+				if m.addSSHFieldSel < 6 {
+					m.addSSHFieldSel++
+				} else {
+					// Save
+					alias := strings.TrimSpace(m.addSSHAlias.Value())
+					hostName := strings.TrimSpace(m.addSSHHostName.Value())
+					user := strings.TrimSpace(m.addSSHUser.Value())
+					portStr := strings.TrimSpace(m.addSSHPort.Value())
+					proxyJump := strings.TrimSpace(m.addSSHProxyJump.Value())
+					identityFile := strings.TrimSpace(m.addSSHIdentityFile.Value())
+
+					port := 0
+					if portStr != "" {
+						if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
+							port = p
+						} else {
+							m.setStatus("add host: invalid port (must be a positive integer)", 3500)
+							return m, nil
+						}
+					}
+
+					if err := AppendPrimaryHostBlock(AddPrimaryHostParams{
+						Alias:        alias,
+						HostName:     hostName,
+						User:         user,
+						Port:         port,
+						ProxyJump:    proxyJump,
+						ForwardAgent: m.addSSHForwardAgent, // default true
+						IdentityFile: identityFile,
+					}); err != nil {
+						m.setStatus(fmt.Sprintf("add host failed: %v", err), 4500)
+						return m, nil
+					}
+
+					// Close modal + refresh
+					m.showAddSSHHost = false
+					m.addSSHFieldSel = 0
+					m.addSSHAlias.SetValue("")
+					m.addSSHHostName.SetValue("")
+					m.addSSHUser.SetValue("")
+					m.addSSHPort.SetValue("")
+					m.addSSHProxyJump.SetValue("")
+					m.addSSHIdentityFile.SetValue("")
+					m.addSSHForwardAgent = true
+
+					// Refresh duplicates map and TUI candidates (best-effort).
+					if rep, err := ComputePrimaryDuplicateAliases(); err == nil && rep != nil && rep.AliasToBlocks != nil {
+						m.dupAliasCount = make(map[string]int)
+						for a, blocks := range rep.AliasToBlocks {
+							a = strings.TrimSpace(a)
+							if a == "" {
+								continue
+							}
+							m.dupAliasCount[a] = len(blocks)
+						}
+					}
+					if conf, err := LoadConfigFromSSH(); err == nil && conf != nil {
+						m.cfg = conf
+						m.candidates = buildCandidates(conf)
+						m.recomputeFilter()
+					}
+
+					m.setStatus(fmt.Sprintf("added host: %s", alias), 2500)
+					return m, tea.ClearScreen
+				}
+			case "shift+tab":
+				if m.addSSHFieldSel > 0 {
+					m.addSSHFieldSel--
+				}
+				return m, nil
+			case " ":
+				// Space toggles ForwardAgent when focused on that row.
+				if m.addSSHFieldSel == 5 {
+					m.addSSHForwardAgent = !m.addSSHForwardAgent
+					return m, nil
+				}
+			}
+
+			// Focus management + let focused input update.
+			m.addSSHAlias.Blur()
+			m.addSSHHostName.Blur()
+			m.addSSHUser.Blur()
+			m.addSSHPort.Blur()
+			m.addSSHProxyJump.Blur()
+			m.addSSHIdentityFile.Blur()
+
+			switch m.addSSHFieldSel {
+			case 0:
+				m.addSSHAlias.Focus()
+				var cmd tea.Cmd
+				m.addSSHAlias, cmd = m.addSSHAlias.Update(msg)
+				return m, cmd
+			case 1:
+				m.addSSHHostName.Focus()
+				var cmd tea.Cmd
+				m.addSSHHostName, cmd = m.addSSHHostName.Update(msg)
+				return m, cmd
+			case 2:
+				m.addSSHUser.Focus()
+				var cmd tea.Cmd
+				m.addSSHUser, cmd = m.addSSHUser.Update(msg)
+				return m, cmd
+			case 3:
+				m.addSSHPort.Focus()
+				var cmd tea.Cmd
+				m.addSSHPort, cmd = m.addSSHPort.Update(msg)
+				return m, cmd
+			case 4:
+				m.addSSHProxyJump.Focus()
+				var cmd tea.Cmd
+				m.addSSHProxyJump, cmd = m.addSSHProxyJump.Update(msg)
+				return m, cmd
+			case 6:
+				m.addSSHIdentityFile.Focus()
+				var cmd tea.Cmd
+				m.addSSHIdentityFile, cmd = m.addSSHIdentityFile.Update(msg)
+				return m, cmd
+			default:
+				// ForwardAgent row (5) isn't a textinput; ignore.
+				return m, nil
+			}
+		}
+
 		// Host Settings overlay: modal navigation + actions
 		if m.showHostSettings {
 			switch msg.String() {
@@ -387,7 +670,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.recomputeFilter()
 				return m, tea.ClearScreen
 			case "j", "down":
-				if m.hostSettingsSel < 4 {
+				if m.hostSettingsSel < 5 {
 					m.hostSettingsSel++
 				}
 				return m, nil
@@ -402,6 +685,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// 2: Credential delete
 				// 3: Logging toggle
 				// 4: Install my public key (authorized_keys)
+				// 5: Add SSH Host (append to ~/.ssh/config)
+				//
+				// Note:
+				// Add SSH Host should be available even when no host is selected.
+				if m.hostSettingsSel == 5 {
+					// IMPORTANT:
+					// Close Host Settings when opening the Add SSH Host modal; otherwise the Host Settings
+					// overlay will continue to render and the new modal will appear "frozen"/hidden.
+					m.showHostSettings = false
+
+					// Add SSH Host (append to ~/.ssh/config). Defaults ForwardAgent=yes.
+					m.showAddSSHHost = true
+					m.addSSHFieldSel = 0
+					m.addSSHAlias.SetValue("")
+					m.addSSHHostName.SetValue("")
+					m.addSSHUser.SetValue("")
+					m.addSSHPort.SetValue("")
+					m.addSSHProxyJump.SetValue("")
+					m.addSSHIdentityFile.SetValue("")
+					m.addSSHForwardAgent = true
+					m.addSSHAlias.Focus()
+					m.setStatus("add host: fill fields, Enter to advance, Enter on last field to save", 3500)
+					return m, tea.ClearScreen
+				}
+
 				if sel := m.current(); sel != nil {
 					hostKey := strings.TrimSpace(sel.Resolved.Host.Name)
 					if hostKey == "" {
@@ -545,6 +853,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 						// Keep the modal open so the user can re-run or inspect settings; also give a clear next-step hint.
 						m.setStatus("Key install started in a new tmux window (look for output there).", 4500)
+						return m, nil
+
+					case 5:
+						// Add SSH Host is handled above (allowed even with no current host selection).
 						return m, nil
 					}
 				}
@@ -2759,6 +3071,38 @@ func (m *model) handleGlobalKeys(k tea.KeyMsg) (handled bool, quit bool) {
 		m.quitting = true
 		return true, true
 
+	case "M":
+		// Merge duplicate Host blocks for the selected alias in primary ~/.ssh/config.
+		// This now requires explicit confirmation (modal).
+		if m.showHelp || m.showLogs || m.showDashBrowser || m.showCmdline || m.showHostSettings || m.showMergeDupsConfirm {
+			return false, false
+		}
+		sel := m.current()
+		if sel == nil {
+			m.setStatus("merge: no host selected", 1500)
+			return true, false
+		}
+		alias := strings.TrimSpace(sel.Resolved.Host.Name)
+		if alias == "" {
+			m.setStatus("merge: empty host alias", 1500)
+			return true, false
+		}
+		n := 0
+		if m.dupAliasCount != nil {
+			n = m.dupAliasCount[alias]
+		}
+		if n < 2 {
+			m.setStatus("merge: no duplicates for selected alias in ~/.ssh/config", 2500)
+			return true, false
+		}
+
+		m.showMergeDupsConfirm = true
+		m.mergeDupsAlias = alias
+		m.mergeDupsCount = n
+		m.mergeDupsConfirmHint = "This will modify ~/.ssh/config (a .bak will be written)."
+		m.input.Blur()
+		return true, false
+
 	case "ctrl+s":
 		// Save current window as a recorded dashboard (hotkey).
 		// This is intended for NOC workflows: build panes, :watchall ..., resize, then ctrl+s to save.
@@ -2915,6 +3259,26 @@ func (m model) View() string {
 	if m.showHostSettings {
 		b.WriteString(m.theme.HeaderLine("Host Settings") + "\n")
 		b.WriteString(m.theme.apply(m.theme.Separator, strings.Repeat("-", maxInt(6, minInt(m.width, 40)))) + "\n")
+
+		// Always render the action list, even when there are no hosts yet.
+		items := []string{
+			"Toggle login mode (manual/askpass)",
+			"Set credential (Keychain)",
+			"Delete credential (Keychain)",
+			"Toggle logging",
+			"Install my public key (authorized_keys)",
+			"Add SSH Host (append to ~/.ssh/config)",
+		}
+		for i, it := range items {
+			prefix := "   "
+			if i == m.hostSettingsSel {
+				prefix = " > "
+			}
+			b.WriteString(fmt.Sprintf("%s%2d) %s\n", prefix, i+1, it))
+		}
+
+		b.WriteString("\n")
+
 		if sel := m.current(); sel != nil {
 			hostKey := strings.TrimSpace(sel.Resolved.Host.Name)
 			loginMode := m.effectiveLoginMode(sel.Resolved)
@@ -2941,32 +3305,73 @@ func (m model) View() string {
 				fmt.Sprintf("Credential: %s", credStatus),
 				fmt.Sprintf("Logging: %s", logPolicy),
 			}
-
-			// Render a tiny action list
-			items := []string{
-				"Toggle login mode (manual/askpass)",
-				"Set credential (Keychain)",
-				"Delete credential (Keychain)",
-				"Toggle logging",
-				"Install my public key (authorized_keys)",
-			}
-
-			for i, it := range items {
-				prefix := "   "
-				if i == m.hostSettingsSel {
-					prefix = " > "
-				}
-				b.WriteString(fmt.Sprintf("%s%2d) %s\n", prefix, i+1, it))
-			}
-
-			b.WriteString("\n")
 			for _, ln := range lines {
 				b.WriteString(ln + "\n")
 			}
 		} else {
 			b.WriteString("No host selected.\n")
+			b.WriteString("Tip: choose 'Add SSH Host' to create ~/.ssh/config and add your first entry.\n")
 		}
+
 		b.WriteString("\nKeys: j/k move • Enter apply • Esc/q close\n")
+		return b.String()
+	}
+
+	// Add SSH Host modal (primary ~/.ssh/config)
+	if m.showAddSSHHost {
+		b.WriteString(m.theme.HeaderLine("Add SSH Host (primary ~/.ssh/config)") + "\n")
+		b.WriteString(m.theme.apply(m.theme.Separator, strings.Repeat("-", maxInt(6, minInt(m.width, 60)))) + "\n")
+		b.WriteString("\n")
+
+		rows := []string{
+			m.addSSHAlias.View(),
+			m.addSSHHostName.View(),
+			m.addSSHUser.View(),
+			m.addSSHPort.View(),
+			m.addSSHProxyJump.View(),
+			fmt.Sprintf("ForwardAgent: %s   (Space toggles)", map[bool]string{true: "yes", false: "no"}[m.addSSHForwardAgent]),
+			m.addSSHIdentityFile.View(),
+		}
+
+		for i, r := range rows {
+			prefix := "   "
+			if i == m.addSSHFieldSel {
+				prefix = " > "
+			}
+			b.WriteString(prefix + r + "\n")
+		}
+
+		b.WriteString("\nNotes:\n")
+		b.WriteString("  - HostName will be written (defaults to Alias) so it is visible/searchable like Host.\n")
+		b.WriteString("  - ForwardAgent defaults to yes.\n")
+		b.WriteString("  - A ~/.ssh/config.bak backup will be written.\n")
+		b.WriteString("\nKeys: Enter/Tab next • Shift+Tab prev • Space toggle (ForwardAgent) • Esc cancel\n")
+		return b.String()
+	}
+
+	// Merge duplicates confirmation modal (primary ~/.ssh/config)
+	if m.showMergeDupsConfirm {
+		title := "Merge duplicates"
+		if strings.TrimSpace(m.mergeDupsAlias) != "" {
+			title = fmt.Sprintf("Merge duplicates: %s", m.mergeDupsAlias)
+		}
+
+		b.WriteString(m.theme.HeaderLine(title) + "\n")
+		b.WriteString(m.theme.apply(m.theme.Separator, strings.Repeat("-", maxInt(6, minInt(m.width, 50)))) + "\n")
+		b.WriteString("\n")
+		b.WriteString(fmt.Sprintf("Found %d duplicate Host blocks for alias: %s\n", m.mergeDupsCount, m.mergeDupsAlias))
+		b.WriteString("Action:\n")
+		b.WriteString("  - Replace the FIRST occurrence block with a merged block\n")
+		b.WriteString("  - Delete the remaining duplicate blocks\n")
+		b.WriteString("\n")
+		b.WriteString("Merge semantics:\n")
+		b.WriteString("  - Last-wins per key (User/Port/HostName/ProxyJump/etc)\n")
+		b.WriteString("  - IdentityFile accumulates (all values kept)\n")
+		if strings.TrimSpace(m.mergeDupsConfirmHint) != "" {
+			b.WriteString("\n")
+			b.WriteString(m.mergeDupsConfirmHint + "\n")
+		}
+		b.WriteString("\nKeys: y merge • n/esc cancel\n")
 		return b.String()
 	}
 
@@ -3118,7 +3523,15 @@ func (m model) View() string {
 		for i := m.scroll; i < end; i++ {
 			_, sel := m.selectedSet[i]
 			name := m.filtered[i].Resolved.Host.Name
-			line := m.theme.ListLine(i+1, i == m.selected, sel, m.isFavorite(name), m.filtered[i].Display)
+
+			display := m.filtered[i].Display
+			if m.dupAliasCount != nil {
+				if n := m.dupAliasCount[name]; n > 1 {
+					display = fmt.Sprintf("[DUP x%d] %s", n, display)
+				}
+			}
+
+			line := m.theme.ListLine(i+1, i == m.selected, sel, m.isFavorite(name), display)
 			leftLines = append(leftLines, line)
 		}
 		if end < len(m.filtered) {
@@ -3211,6 +3624,15 @@ func (m model) View() string {
 		rightLines = append(rightLines, "  "+shellEscapeForSh(binDisp))
 		rightLines = append(rightLines, "  ssh --tmux --host "+shellEscapeForSh(hostKey)+userFlag)
 
+		// Duplicate warning (primary ~/.ssh/config only)
+		if m.dupAliasCount != nil {
+			if n := m.dupAliasCount[hostKey]; n > 1 {
+				rightLines = append(rightLines, "")
+				rightLines = append(rightLines, fmt.Sprintf("WARNING: %d duplicate Host blocks in ~/.ssh/config", n))
+				rightLines = append(rightLines, "  Press M to merge (replace first, delete rest)")
+			}
+		}
+
 		// Selection state (keep brief)
 		rightLines = append(rightLines, "")
 		selCount := m.selectedCount()
@@ -3278,7 +3700,7 @@ func (m model) View() string {
 	if m.recording {
 		recState = "ON"
 	}
-	b.WriteString(fmt.Sprintf("\nKeys: j/k move • / search • ? reverse • Enter connect • Space multi • S host settings • :menu • :help • q quit   |   managed panes: %d   |   REC: %s\n", managed, recState))
+	b.WriteString(fmt.Sprintf("\nKeys: j/k move • / search • ? reverse • Enter connect • Space multi • S host settings • M merge-dups • :menu • :help • q quit   |   managed panes: %d   |   REC: %s\n", managed, recState))
 
 	return b.String()
 }
