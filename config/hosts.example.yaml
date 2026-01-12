@@ -1,0 +1,130 @@
+# tmux-ssh-manager example configuration
+#
+# Save this file as:
+#   ~/.config/tmux-ssh-manager/hosts.yaml
+#
+# Schema:
+# groups:
+#   - name: <group-name>
+#     default_user: <string>        # optional; fallback if host.user is empty
+#     default_port: <int>           # optional; fallback if host.port is empty (defaults to 22)
+#     jump_host: <host-or-user@host> # optional; used as SSH ProxyJump for all hosts in this group
+#
+# hosts:
+#   - name: <hostname-or-ip>        # required; do NOT include "user@" here
+#     group: <group-name>           # optional; applies group defaults
+#     user: <string>                # optional; overrides group default_user
+#     port: <int>                   # optional; overrides group default_port
+#     jump_host: <host-or-user@host> # optional; overrides group jump_host
+#     tags: [list, of, strings]     # optional; used only for searching/filtering in the UI
+#
+#     # Topology / network-device metadata (used by upcoming "Network View"):
+#     # - network_device: when true, the host is treated as a network device (switch/router)
+#     # - network_os: selects the command/parser used for LLDP neighbors collection
+#     #   Supported (initial): cisco_iosxe | sonic_dell
+#     network_device: <bool>        # optional; default false
+#     network_os: <string>          # optional; required if network_device: true
+#
+# Resolution rules:
+# - user: host.user > group.default_user > $USER
+# - port: host.port > group.default_port > 22
+# - jump_host: host.jump_host > group.jump_host > none
+#
+# Notes:
+# - Keep "name" as a plain host/IP (no "user@"). Set the "user" field separately.
+# - jump_host can include a username if needed, e.g., "bastion.example.com" or "jumpuser@bastion.example.com".
+# - Unknown keys in YAML are ignored; stick to the documented fields above.
+#
+# Router-ID (loopback) note:
+# - Router-ID is NOT stored in this YAML. It is stored per-host via the in-TUI (S) Host Settings menu
+#   as local host extras (router_id=...) and is used only as an identity hint when parsing LLDP output.
+
+# ---------------------------------------------------------------------------
+# Groups: define folders and defaults (akin to SecureCRT session folders)
+# ---------------------------------------------------------------------------
+groups:
+  # Data Center 1: shared defaults for many production devices
+  - name: dc1
+    default_user: netops
+    default_port: 22
+    jump_host: bastion.dc1.example.com
+    on_connect:
+      - terminal length 0
+      - show version | include Serial
+
+  # Lab environment: often a different default user
+  - name: lab
+    default_user: labuser
+    # default_port: 22  # (implicit)
+
+  # Remote sites could share a different bastion/jump host
+  - name: remote-sites
+    default_user: fieldops
+    jump_host: opsjump.remote.example.net
+
+# ---------------------------------------------------------------------------
+# Hosts: the actual devices you connect to
+# ---------------------------------------------------------------------------
+hosts:
+  # Inherits dc1 defaults (user=netops, port=22, jump=bastion.dc1.example.com)
+  - name: rtr1.dc1.example.com
+    group: dc1
+    tags: [router, ios-xe, core]
+    on_connect:
+      - show ip interface brief
+      - show arp | include Vlan
+
+  # Override user at the host level (will still use dc1 jump host)
+  - name: rtr2.dc1.example.com
+    group: dc1
+    user: admin
+    tags: [router, ios-xe, dist]
+
+  # Override SSH port for a single host
+  - name: fw1.dc1.example.com
+    group: dc1
+    port: 2222
+    tags: [firewall, pan]
+
+  # Lab device: uses lab default user; no jump host
+  - name: leaf01.lab.local
+    group: lab
+    network_device: true
+    network_os: sonic_dell
+    tags: [lab, leaf, sonic, dell]
+
+  # IPv6 address example (quotes recommended for IPv6 literals)
+  - name: "2001:db8::10"
+    group: lab
+    user: v6user
+    tags: [lab, ipv6]
+
+  # Host-specific jump host override (will use this instead of group jump)
+  - name: edge1.remote.example.net
+    group: remote-sites
+    jump_host: jumpuser@altjump.remote.example.net
+    tags: [wan, edge]
+
+  # Device with fully specified user and port, no group defaults
+  - name: console.server.example.net
+    user: console
+    port: 2201
+    tags: [oob, console]
+
+  # Another lab device, showcasing multi-word tags
+  - name: spine01.lab.local
+    group: lab
+    network_device: true
+    network_os: cisco_iosxe
+    tags:
+      - lab
+      - cisco
+      - ios-xe
+      - "spine-switch"
+
+  # Example of a host reachable without any jump host
+  - name: access01.office.example.com
+    user: admin
+    tags: [office, access, aruba]
+
+# End of file
