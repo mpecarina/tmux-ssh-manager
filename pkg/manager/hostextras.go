@@ -142,6 +142,8 @@ func (x HostExtras) Normalize() HostExtras {
 
 	out.KeyInstallPubKeyPath = strings.TrimSpace(out.KeyInstallPubKeyPath)
 	if out.KeyInstallPubKeyPath == "" {
+		// Default: Linux-oriented baseline. If this file doesn't exist, the key-install flow
+		// should fall back to other detected keys (see keyinstall.go DetectLocalPublicKeys).
 		out.KeyInstallPubKeyPath = "~/.ssh/id_rsa.pub"
 	}
 

@@ -1022,7 +1022,7 @@ func runHostExtrasSwitchToIdentitySubcommand(args []string) error {
 	var hostKey string
 	var identityFile string
 	fs.StringVar(&hostKey, "host", "", "Host key / alias (used for extras file lookup)")
-	fs.StringVar(&identityFile, "identity-file", "~/.ssh/id_rsa", "Identity file to persist when switching to identity auth (default: ~/.ssh/id_rsa)")
+	fs.StringVar(&identityFile, "identity-file", "", "Identity file to persist when switching to identity auth (default: auto-detect ~/.ssh/id_ed25519 then ~/.ssh/id_rsa)")
 	fs.SetOutput(os.Stderr)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1034,7 +1034,19 @@ func runHostExtrasSwitchToIdentitySubcommand(args []string) error {
 		return errors.New("usage: tmux-ssh-manager __hostextras-switch-to-identity --host <hostkey> [--identity-file <path>]")
 	}
 	if identityFile == "" {
-		identityFile = "~/.ssh/id_rsa"
+		// Prefer modern keys. If the file doesn't exist, fall back to RSA.
+		// Note: This is only the persisted default used when switching a host to key-based auth.
+		// The underlying ssh client may still choose other keys via agent/config.
+		home, err := os.UserHomeDir()
+		if err == nil && strings.TrimSpace(home) != "" {
+			if _, err := os.Stat(filepath.Join(home, ".ssh", "id_ed25519")); err == nil {
+				identityFile = "~/.ssh/id_ed25519"
+			} else {
+				identityFile = "~/.ssh/id_rsa"
+			}
+		} else {
+			identityFile = "~/.ssh/id_rsa"
+		}
 	}
 
 	ex, err := manager.LoadHostExtras(hostKey)

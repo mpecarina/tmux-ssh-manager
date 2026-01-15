@@ -252,7 +252,7 @@ func newModel(cfg *Config, opts UIOptions) model {
 	// Add SSH Host form inputs (primary ~/.ssh/config)
 	ai := textinput.New()
 	ai.Prompt = "Alias: "
-	ai.Placeholder = "e.g. rtr1.dc1.example.com"
+	ai.Placeholder = "e.g. narrs-dev1.lmig.com"
 	ai.CharLimit = 256
 
 	hni := textinput.New()
@@ -6429,11 +6429,21 @@ func (m *model) tmuxInstallMyKey(r ResolvedHost, replace bool) error {
 	if strings.TrimSpace(extras.KeyInstallPubKeyPath) != "" {
 		pub, err = ReadLocalPublicKey(extras.KeyInstallPubKeyPath)
 		if err != nil {
-			return err
+			// If a configured path is missing/unreadable, fall back to auto-detection
+			// instead of failing outright. This handles setups where ssh defaults to
+			// id_ed25519 but id_rsa.pub isn't present.
+			keys, derr := DetectLocalPublicKeys()
+			if derr != nil {
+				return derr
+			}
+			if len(keys) == 0 {
+				return fmt.Errorf("no local public keys found under ~/.ssh (configured key_install_pubkey=%s)", strings.TrimSpace(extras.KeyInstallPubKeyPath))
+			}
+			pub = keys[0]
 		}
 	} else {
 		// Default: Linux-oriented baseline key. Prefer ~/.ssh/id_rsa.pub unless explicitly overridden per host.
-		// If it's missing/unreadable, fall back to auto-detection.
+		// If it's missing/unreadable, fall back to auto-detection (ed25519, ecdsa, rsa, etc.).
 		pub, err = ReadLocalPublicKey("~/.ssh/id_rsa.pub")
 		if err != nil {
 			keys, derr := DetectLocalPublicKeys()
@@ -6441,7 +6451,7 @@ func (m *model) tmuxInstallMyKey(r ResolvedHost, replace bool) error {
 				return derr
 			}
 			if len(keys) == 0 {
-				return fmt.Errorf("no local public keys found under ~/.ssh (expected id_rsa.pub)")
+				return fmt.Errorf("no local public keys found under ~/.ssh (expected id_rsa.pub or other *.pub)")
 			}
 			pub = keys[0]
 		}
