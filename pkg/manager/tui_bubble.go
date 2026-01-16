@@ -922,6 +922,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.showAddSSHHost {
 			switch msg.String() {
 			case "q":
+				// In this modal, q should cancel/close (never quit the whole program).
 				m.showAddSSHHost = false
 				m.addSSHFieldSel = 0
 				m.addSSHCmdMode = false
@@ -934,6 +935,42 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.addSSHProxyJump.Blur()
 				m.addSSHIdentityFile.Blur()
 				m.setStatus("add host: cancelled", 1200)
+				return m, tea.ClearScreen
+
+			case "ctrl+e":
+				// Open primary SSH config in $EDITOR (fallback vim) in a tmux split.
+				// Goal: let the user make complex edits and return to the TUI without quitting.
+				primary, err := LoadSSHConfigPrimaryPath()
+				if err != nil {
+					m.setStatus(fmt.Sprintf("edit ssh config: %v", err), 3500)
+					return m, nil
+				}
+
+				editor := strings.TrimSpace(os.Getenv("EDITOR"))
+				if editor == "" {
+					editor = strings.TrimSpace(os.Getenv("VISUAL"))
+				}
+				if editor == "" {
+					editor = "vim"
+				}
+
+				// Best-effort: restore terminal state before launching the editor.
+				// This helps avoid hidden cursor / odd tty modes inside the split.
+				restoreTerminalForExec()
+
+				// Run editor inside a new tmux split, wait for it to exit, then return.
+				// Use bash -lc so $EDITOR entries like "code -w" or "nvim -u ..." work.
+				cmdline := fmt.Sprintf("%s %q", editor, primary)
+				cmd := exec.Command("tmux", "split-window", "-v", "-c", "#{pane_current_path}", "bash", "-lc", cmdline)
+				cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+				if err := cmd.Run(); err != nil {
+					m.setStatus(fmt.Sprintf("edit ssh config: %v", err), 3500)
+					return m, nil
+				}
+
+				m.setStatus("ssh config: editor closed", 1500)
+				// Note: we intentionally keep the Add SSH Host modal open so the user can continue
+				// (or cancel) without losing typed values.
 				return m, tea.ClearScreen
 
 			case "esc":
@@ -3948,9 +3985,20 @@ func (m *model) handleGlobalKeys(k tea.KeyMsg) (handled bool, quit bool) {
 		return true, true
 
 	case "q":
-		// In modals/overlays, q should behave like "close" (return to host list),
-		// not "quit the whole program". Only quit when no modal is active.
-		if m.showHelp || m.showLogs || m.showDashBrowser || m.showCmdline || m.showHostSettings {
+		// Consistent rule:
+		// - If ANY modal/overlay is active, let that layer handle "q" as close/cancel.
+		// - Only quit the entire program when no modal/overlay is active.
+		if m.showHelp ||
+			m.showLogs ||
+			m.showDashBrowser ||
+			m.showCmdline ||
+			m.showHostSettings ||
+			m.showAddSSHHost ||
+			m.showMergeDupsConfirm ||
+			m.showRouterIDEditor ||
+			m.showMgmtIPEditor ||
+			m.showDeviceOSEditor ||
+			m.showNetworkView {
 			return false, false
 		}
 		m.quitting = true
@@ -4370,7 +4418,7 @@ func (m model) View() string {
 		if strings.TrimSpace(m.numBuf) != "" {
 			numHint = fmt.Sprintf(" • Num: %s", m.numBuf)
 		}
-		b.WriteString("\nKeys: j/k move • gg/G top/bot • 1-7 then Enter jump • Enter/Tab next • Shift+Tab prev • Space toggle (ForwardAgent) • Esc cancel" + numHint + "\n")
+		b.WriteString("\nKeys: j/k move • gg/G top/bot • 1-7 then Enter jump • Enter/Tab next • Shift+Tab prev • Space toggle (ForwardAgent) • Esc cmd-mode • q cancel • Ctrl+E edit ~/.ssh/config" + numHint + "\n")
 		return b.String()
 	}
 
