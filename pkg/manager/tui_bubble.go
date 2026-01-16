@@ -84,6 +84,14 @@ type netLLDPDoneMsg struct {
 	Failures map[string]string // host -> error
 }
 
+// statusMsg is a lightweight message for setting a transient UI status line.
+type statusMsg string
+
+// errMsg is a lightweight message for surfacing an error via the status line.
+type errMsg struct {
+	Err error
+}
+
 type model struct {
 	cfg        *Config
 	opts       UIOptions
@@ -568,6 +576,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ready = true
 		return m, nil
 
+	case tea.SuspendMsg:
+		// No-op: we no longer use Bubble Tea suspend for external editor launching.
+		return m, nil
+
+	case statusMsg:
+		m.setStatus(string(msg), 2500)
+		return m, nil
+
+	case errMsg:
+		if msg.Err != nil {
+			m.setStatus(msg.Err.Error(), 4000)
+		} else {
+			m.setStatus("error", 2500)
+		}
+		return m, nil
+
 	case netLLDPProgressMsg:
 		m.netLoading = true
 		m.netStatus = msg.Status
@@ -938,29 +962,57 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.ClearScreen
 
 			case "ctrl+e":
-				// Open primary SSH config in $EDITOR (fallback vim) in a tmux split.
-				// Goal: let the user make complex edits and return to the TUI without quitting.
+				// Open primary SSH config in vi.
+				//
+				// Popup-aware behavior:
+				// - In a tmux popup, splits/windows are hidden behind the popup. Instead, open a nested
+				//   tmux popup running vi, then return when vi exits.
+				// - Otherwise, open vi in a tmux split for a nicer workflow.
 				primary, err := LoadSSHConfigPrimaryPath()
 				if err != nil {
 					m.setStatus(fmt.Sprintf("edit ssh config: %v", err), 3500)
 					return m, nil
 				}
 
-				editor := strings.TrimSpace(os.Getenv("EDITOR"))
-				if editor == "" {
-					editor = strings.TrimSpace(os.Getenv("VISUAL"))
-				}
-				if editor == "" {
-					editor = "vim"
-				}
+				// Hardcode a safe terminal editor.
+				editor := "vi"
 
 				// Best-effort: restore terminal state before launching the editor.
-				// This helps avoid hidden cursor / odd tty modes inside the split.
 				restoreTerminalForExec()
 
-				// Run editor inside a new tmux split, wait for it to exit, then return.
-				// Use bash -lc so $EDITOR entries like "code -w" or "nvim -u ..." work.
-				cmdline := fmt.Sprintf("%s %q", editor, primary)
+				if strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_IN_POPUP")) == "1" {
+					// In a tmux popup, nested popups/splits can be hidden behind the active popup.
+					// Run vi in-place by exec'ing a process through Bubble Tea, then return to the TUI.
+					//
+					// Per requested UX: close the Add SSH Host modal and return to the host list after vi exits.
+					m.showAddSSHHost = false
+					m.addSSHFieldSel = 0
+					m.addSSHCmdMode = false
+					m.pendingG = false
+					m.numBuf = ""
+					m.addSSHAlias.Blur()
+					m.addSSHHostName.Blur()
+					m.addSSHUser.Blur()
+					m.addSSHPort.Blur()
+					m.addSSHProxyJump.Blur()
+					m.addSSHIdentityFile.Blur()
+
+					restoreTerminalForExec()
+
+					cmd := exec.Command(editor, primary)
+					cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+
+					m.setStatus("ssh config: opening vi...", 1500)
+					return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
+						if err != nil {
+							return errMsg{Err: fmt.Errorf("edit ssh config: %w", err)}
+						}
+						return statusMsg("ssh config: editor closed")
+					})
+				}
+
+				// Non-popup: run editor inside a new tmux split, wait for it to exit, then return.
+				cmdline := fmt.Sprintf("exec %s %q", editor, primary)
 				cmd := exec.Command("tmux", "split-window", "-v", "-c", "#{pane_current_path}", "bash", "-lc", cmdline)
 				cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 				if err := cmd.Run(); err != nil {
