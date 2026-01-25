@@ -3599,9 +3599,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Insert-mode (search focused) is the default. In this mode:
 		// - treat nearly all keys as literal text (so j/k/n/q/s/v/etc. are not stolen)
+		// - allow arrow keys to navigate the selection without leaving insert-mode
 		// - only allow explicit mode switches or confirmations
 		if m.input.Focused() {
 			switch msg.String() {
+			case "up":
+				m.move(-1)
+				return m, nil
+			case "down":
+				m.move(1)
+				return m, nil
+
 			case "enter":
 				// Confirm current selection while staying in the main flow.
 				// Mirror tmux-session-manager behavior: accept even if search is focused.
