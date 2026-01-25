@@ -3471,8 +3471,61 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// When search has focus, prioritize it
+		// When search has focus, prioritize it — but still allow "accept/connect"
+		// without forcing the user to leave insert-style mode.
 		if m.input.Focused() {
+			switch msg.String() {
+			case "enter":
+				// Confirm current selection while staying in the main flow.
+				// Mirror tmux-session-manager behavior: accept even if search is focused.
+				m.input.Blur()
+				m.recomputeFilter()
+				targets := m.selectedResolved()
+				if len(targets) == 0 {
+					if sel := m.current(); sel != nil {
+						targets = []ResolvedHost{sel.Resolved}
+					}
+				}
+				if len(targets) == 0 {
+					return m, nil
+				}
+
+				// Outside tmux: connect inline (single target only).
+				if strings.TrimSpace(os.Getenv("TMUX")) == "" {
+					if len(targets) != 1 {
+						m.setStatus("Multi-select connect requires tmux (panes/windows). Start tmux or select a single host.", 3500)
+						return m, nil
+					}
+					r := targets[0]
+					m.addRecent(r.Host.Name)
+					m.saveState()
+					return m.connectOrQuit(r)
+				}
+
+				// In tmux: default to new window(s), with split fallback (same as main Enter behavior).
+				failed := 0
+				for _, r := range targets {
+					if _, err := m.tmuxNewWindow(r); err != nil {
+						if _, serr := m.tmuxSplitV(r); serr != nil {
+							failed++
+							continue
+						}
+					}
+					m.addRecent(r.Host.Name)
+				}
+				if failed > 0 {
+					m.setStatus(fmt.Sprintf("Opened %d, %d failed", len(targets)-failed, failed), 2500)
+				}
+				m.saveState()
+				return m.quit()
+
+			case "esc":
+				// Preserve existing UX: Esc exits search focus.
+				m.input.Blur()
+				m.recomputeFilter()
+				return m, nil
+			}
+
 			var cmd tea.Cmd
 			m.input, cmd = m.input.Update(msg)
 
