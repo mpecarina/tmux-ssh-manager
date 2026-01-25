@@ -248,6 +248,8 @@ func newModel(cfg *Config, opts UIOptions) model {
 	ti.Cursor.Style = ti.Cursor.Style.Bold(true)
 	ti.SetValue(strings.TrimSpace(opts.InitialQuery))
 	ti.PromptStyle = ti.PromptStyle.Bold(true)
+	// Start in "insert" mode by default: search is focused so typing immediately filters.
+	ti.Focus()
 
 	// ":" command bar (SecureCRT-like). Kept separate from search input.
 	ci := textinput.New()
@@ -2457,6 +2459,166 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					openDashBrowser()
 					return m, tea.ClearScreen
 
+				case "split":
+					// :split <N> [v|h|window] [layout]
+					// :split v|h                    (legacy)
+					//
+					// Single-host fanout:
+					// Opens N total connections to the currently selected host, using:
+					// - v: stacked splits (tmux split-window -v)
+					// - h: side-by-side splits (tmux split-window -h)
+					// - window: one new tmux window per connection
+					//
+					// Notes:
+					// - This is intentionally single-host only (uses current selection).
+					// - Requires tmux.
+					args := strings.Fields(strings.TrimSpace(rest))
+					if len(args) < 1 || strings.TrimSpace(args[0]) == "" {
+						m.setStatus("Usage: :split <N> [v|h|window] [layout]  (or legacy: :split v|h)", 3500)
+						return m, tea.ClearScreen
+					}
+
+					// Legacy behavior: :split v|h (no count)
+					if strings.EqualFold(strings.TrimSpace(args[0]), "v") || strings.EqualFold(strings.TrimSpace(args[0]), "h") {
+						// Fall through to legacy handler below by rewriting rest and continuing.
+						// We keep this case here so help/usage stays discoverable in one place.
+						arg := strings.ToLower(strings.TrimSpace(args[0]))
+						targets := m.currentOrSelectedResolved()
+						if len(targets) == 0 {
+							m.setStatus("No target selected", 1500)
+							return m, tea.ClearScreen
+						}
+						failed := 0
+						switch arg {
+						case "v":
+							for _, r := range targets {
+								if _, err := m.tmuxSplitH(r); err != nil {
+									failed++
+									continue
+								}
+								m.addRecent(r.Host.Name)
+							}
+						case "h":
+							for _, r := range targets {
+								if _, err := m.tmuxSplitV(r); err != nil {
+									failed++
+									continue
+								}
+								m.addRecent(r.Host.Name)
+							}
+						}
+						if failed > 0 {
+							m.setStatus(fmt.Sprintf("Opened %d, %d failed", len(targets)-failed, failed), 2500)
+						}
+						m.saveState()
+						return m.quit()
+					}
+
+					// New behavior: :split <N> [mode] [layout]
+					n, err := strconv.Atoi(strings.TrimSpace(args[0]))
+					if err != nil || n <= 0 {
+						m.setStatus("split: N must be a positive integer (or use legacy: :split v|h)", 3500)
+						return m, tea.ClearScreen
+					}
+					mode := "window"
+					if len(args) >= 2 && strings.TrimSpace(args[1]) != "" {
+						mode = strings.ToLower(strings.TrimSpace(args[1]))
+					}
+					// Shorthand aliases
+					if mode == "w" {
+						mode = "window"
+					}
+					layout := ""
+					if len(args) >= 3 {
+						layout = strings.TrimSpace(strings.Join(args[2:], " "))
+					}
+					if mode != "v" && mode != "h" && mode != "window" {
+						m.setStatus("split: mode must be v, h, window (or w)", 3500)
+						return m, tea.ClearScreen
+					}
+
+					if strings.TrimSpace(os.Getenv("TMUX")) == "" {
+						m.setStatus("split: requires tmux", 2500)
+						return m, tea.ClearScreen
+					}
+
+					sel := m.current()
+					if sel == nil {
+						m.setStatus("split: no host selected", 2500)
+						return m, tea.ClearScreen
+					}
+					r := sel.Resolved
+
+					// For N==1, behave like default "enter": new window connect (in tmux).
+					if n == 1 {
+						if _, err := m.tmuxNewWindow(r); err != nil {
+							_, _ = m.tmuxSplitV(r)
+						}
+						m.addRecent(r.Host.Name)
+						m.saveState()
+						return m.quit()
+					}
+
+					switch mode {
+					case "window":
+						failed := 0
+						for i := 0; i < n; i++ {
+							if _, err := m.tmuxNewWindow(r); err != nil {
+								failed++
+								continue
+							}
+							m.addRecent(r.Host.Name)
+						}
+						if failed > 0 {
+							m.setStatus(fmt.Sprintf("Opened %d, %d failed", n-failed, failed), 2500)
+						}
+						m.saveState()
+						return m.quit()
+
+					case "v", "h":
+						// Create a safe new window for the first connection, then split within it.
+						windowID, err := m.tmuxNewWindow(r)
+						if err != nil {
+							// fallback: if new window fails, do the first connect as a split in current window
+							// and continue splitting there.
+							windowID = ""
+						}
+						m.addRecent(r.Host.Name)
+
+						failed := 0
+						for i := 1; i < n; i++ {
+							if mode == "h" {
+								if _, err := m.tmuxSplitH(r); err != nil {
+									failed++
+									continue
+								}
+							} else {
+								if _, err := m.tmuxSplitV(r); err != nil {
+									failed++
+									continue
+								}
+							}
+							m.addRecent(r.Host.Name)
+						}
+
+						if strings.TrimSpace(layout) != "" {
+							// If we created a dedicated window, apply the layout there; otherwise apply to current.
+							target := strings.TrimSpace(windowID)
+							if target == "" {
+								target = "#{window_id}"
+							}
+							_ = exec.Command("tmux", "select-layout", "-t", target, strings.TrimSpace(layout)).Run()
+						}
+
+						if failed > 0 {
+							m.setStatus(fmt.Sprintf("Opened %d, %d failed", n-failed, failed), 2500)
+						}
+						m.saveState()
+						return m.quit()
+					}
+
+					return m, tea.ClearScreen
+
 				case "dash", "dashboard":
 					// :dash -> open browser
 					// :dash <name> -> open browser + preselect match
@@ -2971,42 +3133,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.saveState()
 					return m.quit()
 
-				case "split":
-					// :split v|h
-					arg := strings.ToLower(strings.TrimSpace(rest))
-					targets := m.currentOrSelectedResolved()
-					if len(targets) == 0 {
-						m.setStatus("No target selected", 1500)
-						return m, tea.ClearScreen
-					}
-					failed := 0
-					switch arg {
-					case "v":
-						for _, r := range targets {
-							if _, err := m.tmuxSplitH(r); err != nil {
-								failed++
-								continue
-							}
-							m.addRecent(r.Host.Name)
-						}
-					case "h":
-						for _, r := range targets {
-							if _, err := m.tmuxSplitV(r); err != nil {
-								failed++
-								continue
-							}
-							m.addRecent(r.Host.Name)
-						}
-					default:
-						m.setStatus("Usage: :split v|h", 2500)
-						return m, tea.ClearScreen
-					}
-					if failed > 0 {
-						m.setStatus(fmt.Sprintf("Opened %d, %d failed", len(targets)-failed, failed), 2500)
-					}
-					m.saveState()
-					return m.quit()
-
 				case "window", "w":
 					// Alias to "connect in new window(s)"
 					targets := m.currentOrSelectedResolved()
@@ -3471,8 +3597,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// When search has focus, prioritize it — but still allow "accept/connect"
-		// without forcing the user to leave insert-style mode.
+		// Insert-mode (search focused) is the default. In this mode:
+		// - treat nearly all keys as literal text (so j/k/n/q/s/v/etc. are not stolen)
+		// - only allow explicit mode switches or confirmations
 		if m.input.Focused() {
 			switch msg.String() {
 			case "enter":
@@ -3520,12 +3647,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.quit()
 
 			case "esc":
-				// Preserve existing UX: Esc exits search focus.
+				// Explicitly exit insert-mode -> Normal-mode (vim mental model).
+				// In Normal-mode, j/k/n/q/... work as motions/actions.
 				m.input.Blur()
 				m.recomputeFilter()
 				return m, nil
+
+			case ":":
+				// Explicitly enter command mode from insert-mode.
+				m.pendingG = false
+				m.input.Blur()
+				m.showHelp = false
+				m.showCmdline = true
+				m.cmdSuggestIdx = -1
+				if m.cmdCandidates == nil {
+					m.cmdCandidates = m.buildCmdCandidates()
+				}
+				m.cmdline.SetValue("")
+				m.cmdline.Focus()
+				return m, tea.ClearScreen
 			}
 
+			// Default: treat as text input (including q/j/k/n/s/v/etc.)
 			var cmd tea.Cmd
 			m.input, cmd = m.input.Update(msg)
 

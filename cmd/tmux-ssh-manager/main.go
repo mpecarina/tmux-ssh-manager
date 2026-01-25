@@ -35,6 +35,11 @@ var (
 	flagTUISource string // "yaml" (default) or "ssh"
 	flagSSHConfig string // comma-separated paths; defaults to ~/.ssh/config when empty
 
+	// New: direct-connect tmux fanout (single host)
+	flagSplitCount  int
+	flagSplitLayout string
+	flagSplitMode   string
+
 	// Hidden flag: use classic TUI engine (line-oriented) instead of Bubble Tea
 	flagTUIClassic bool
 )
@@ -48,6 +53,12 @@ func init() {
 	flag.IntVar(&flagMaxResults, "max", 20, "Maximum results to display in the TUI")
 	flag.BoolVar(&flagPrintConfig, "print-config-path", false, "Print the resolved config path(s) and exit")
 	flag.BoolVar(&flagDryRun, "dry-run", false, "Print the ssh command that would be executed and exit")
+
+	// New: direct-connect tmux fanout (single host)
+	// Usage: --host <name> --split-count N [--split-mode v|h|window] [--split-layout tiled|even-horizontal|even-vertical|main-horizontal|main-vertical|<raw tmux layout>]
+	flag.IntVar(&flagSplitCount, "split-count", 0, "When used with --host inside tmux, open N total connections to the same host (1 = single connect; >1 creates additional panes/windows)")
+	flag.StringVar(&flagSplitMode, "split-mode", "window", "When used with --split-count>0: 'window' (default) opens each connection in a new tmux window; 'v' uses vertical splits; 'h' uses horizontal splits")
+	flag.StringVar(&flagSplitLayout, "split-layout", "", "When used with --split-count>1 and split mode is 'v' or 'h', apply tmux select-layout with this value (e.g. tiled, even-horizontal, even-vertical, main-horizontal, main-vertical, or a raw tmux layout string)")
 
 	// New flags for SSH-config-backed TUI
 	flag.StringVar(&flagTUISource, "tui-source", "yaml", "Source for TUI/list: 'yaml' (default) or 'ssh'")
@@ -332,6 +343,15 @@ func main() {
 	}
 
 	if flagHost != "" {
+		// Direct-connect with optional tmux fanout (single host -> N panes/windows)
+		if strings.TrimSpace(os.Getenv("TMUX")) != "" && flagSplitCount > 0 {
+			if err := runDirectConnectWithSplits(cfg, flagHost, flagSplitCount, flagSplitMode, flagSplitLayout, flagExecReplace, flagDryRun, sshArgs); err != nil {
+				fmt.Fprintf(os.Stderr, "tmux-ssh-manager: %v\n", err)
+				os.Exit(exitCodeFromErr(err))
+			}
+			return
+		}
+
 		if err := runDirectConnect(cfg, flagHost, flagExecReplace, flagDryRun, sshArgs); err != nil {
 			fmt.Fprintf(os.Stderr, "tmux-ssh-manager: %v\n", err)
 			os.Exit(exitCodeFromErr(err))
@@ -440,6 +460,142 @@ func runDirectConnect(cfg *manager.Config, hostArg string, execReplace, dryRun b
 		return nil
 	}
 	return execOrRun(argv, execReplace)
+}
+
+// runDirectConnectWithSplits opens multiple connections to the SAME host (single host selection),
+// using panes (splits) or windows inside the current tmux session.
+//
+// Semantics:
+// - count <= 0: error
+// - count == 1: behaves like runDirectConnect() (no extra panes/windows)
+// - mode:
+//   - "window" (default): open each connection in a new tmux window
+//   - "v": create stacked splits (tmux split-window -v) for additional connections
+//   - "h": create side-by-side splits (tmux split-window -h) for additional connections
+//
+// - layout: optional; if provided and count > 1 and mode is "v" or "h", runs `tmux select-layout <layout>`
+func runDirectConnectWithSplits(cfg *manager.Config, hostArg string, count int, mode, layout string, execReplace, dryRun bool, extraArgs []string) error {
+	if count <= 0 {
+		return errors.New("split-count must be > 0")
+	}
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		mode = "window"
+	}
+	switch mode {
+	case "window", "v", "h":
+	default:
+		return errors.New("split-mode must be one of: window, v, h")
+	}
+
+	// Split/window fanout is tmux-only.
+	if strings.TrimSpace(os.Getenv("TMUX")) == "" {
+		return errors.New("split-count requires tmux")
+	}
+
+	// For count==1, just do the normal direct connect (still supports dry-run/exec-replace behavior).
+	if count == 1 {
+		return runDirectConnect(cfg, hostArg, execReplace, dryRun, extraArgs)
+	}
+
+	// We deliberately do NOT support exec-replace for split/window fanout; it would replace the manager process.
+	if execReplace {
+		return errors.New("cannot use --exec-replace with --split-count (multiple tmux panes/windows)")
+	}
+
+	// Resolve the final argv we want each pane/window to execute.
+	// We use the *current binary* and invoke the public ssh wrapper so behavior is consistent
+	// (askpass/__connect decision, alias recursion safety, etc).
+	binExec := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_BIN"))
+	if binExec == "" {
+		binExec = "tmux-ssh-manager"
+	}
+	hostArg = strings.TrimSpace(hostArg)
+	if hostArg == "" {
+		return errors.New("empty host")
+	}
+
+	// Build: <bin> ssh --tmux --host <hostArg> -- <extra ssh args...>
+	// Note: extraArgs already came from CLI after flag.Parse(); it does NOT include a literal "--".
+	cmdParts := []string{shellEscapeForSh(binExec), "ssh", "--tmux", "--host", shellEscapeForSh(hostArg)}
+	if dryRun {
+		// If the user asked for dry-run in fanout mode, print what each pane would run (one per line).
+		// We still show the wrapper form since that's what we actually execute under tmux.
+		line := strings.Join(cmdParts, " ")
+		if len(extraArgs) > 0 {
+			esc := make([]string, 0, len(extraArgs))
+			for _, a := range extraArgs {
+				esc = append(esc, shellEscapeForSh(a))
+			}
+			line = line + " -- " + strings.Join(esc, " ")
+		}
+		for i := 0; i < count; i++ {
+			fmt.Println(line)
+		}
+		return nil
+	}
+
+	// Materialize: first connection in a new window/split depending on mode
+	// - For split modes, we keep everything in the current window and create count-1 new panes.
+	// - For window mode, we create count new windows.
+	runLine := strings.Join(cmdParts, " ")
+	if len(extraArgs) > 0 {
+		esc := make([]string, 0, len(extraArgs))
+		for _, a := range extraArgs {
+			esc = append(esc, shellEscapeForSh(a))
+		}
+		runLine = runLine + " -- " + strings.Join(esc, " ")
+	}
+	runLine = "exec " + runLine
+
+	switch mode {
+	case "window":
+		// Open count windows.
+		for i := 0; i < count; i++ {
+			// Best-effort name: host + index
+			winName := hostArg
+			if count > 1 {
+				winName = fmt.Sprintf("%s[%d]", hostArg, i+1)
+			}
+			_ = exec.Command(
+				"tmux",
+				"new-window",
+				"-n", winName,
+				"-c", "#{pane_current_path}",
+				"--",
+				"bash", "-lc", runLine,
+			).Run()
+		}
+		return nil
+
+	case "v", "h":
+		// Start first connection in-place by opening it in a new window (safer than mutating current pane),
+		// then split within that window.
+		//
+		// This mirrors the "dashboard opens in a new window" safety approach used elsewhere in the project.
+		winName := hostArg
+		out, err := exec.Command("tmux", "new-window", "-P", "-F", "#{window_id}", "-n", winName, "-c", "#{pane_current_path}", "--", "bash", "-lc", runLine).Output()
+		if err != nil {
+			return fmt.Errorf("tmux new-window failed: %v", err)
+		}
+		windowID := strings.TrimSpace(string(out))
+
+		splitArg := "-v"
+		if mode == "h" {
+			splitArg = "-h"
+		}
+		for i := 1; i < count; i++ {
+			if _, err := exec.Command("tmux", "split-window", splitArg, "-t", windowID, "-c", "#{pane_current_path}", "--", "bash", "-lc", runLine).Output(); err != nil {
+				return fmt.Errorf("tmux split-window failed: %v", err)
+			}
+		}
+		if strings.TrimSpace(layout) != "" {
+			_ = exec.Command("tmux", "select-layout", "-t", windowID, strings.TrimSpace(layout)).Run()
+		}
+		return nil
+	}
+
+	return nil
 }
 
 // runSSHWrapperSubcommand implements a public "ssh-like" entrypoint that can be aliased as `ssh`.
