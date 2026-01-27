@@ -2856,7 +2856,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							"Recorder: :record start <name> [desc...] • :record stop • :record save [name] • :record delete <name> • :record status\n"+
 							"Host: S settings • :login manual|askpass|status • :cred status|set|delete\n"+
 							"Logs: l viewer • O pager • T toggle logging policy • :logs • :log toggle|on|off\n"+
-							"SSH config: E export selector • I import selector • :ssh export • :ssh import\n"+
+							"SSH config: e edit selected host in ~/.ssh/config • E export selector • I import selector • :ssh export • :ssh import\n"+
 							"Other: y yank • Y yank-all • :run <macro> [split v|split h|window|connect] • q quit\n"+
 							"tmux: prefix+w choose-window • prefix+n/p next/prev",
 						12000,
@@ -4606,6 +4606,107 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, nil
+		case "e":
+			// Edit the selected host's ssh config at the exact file + line for its Host block.
+			//
+			// UX goal:
+			// - Stay on the main host list (no separate selection screen).
+			// - Press `e` to open the *defining* ssh config file and line for the selected alias.
+			//
+			// Implementation:
+			// - Parse OpenSSH config (default loader supports Includes).
+			// - Find the first matching literal Host entry for the alias; use its Source + StartLine.
+			// - Open `vi +<line> <file>` (popup-aware); otherwise open in a tmux split.
+			// - Fallback: open primary ~/.ssh/config if we can't locate a source line.
+			if m.showHelp || m.showLogs || m.showDashBrowser || m.showCmdline || m.showHostSettings || m.showAddSSHHost || m.showMergeDupsConfirm || m.showRouterIDEditor || m.showMgmtIPEditor || m.showDeviceOSEditor || m.showNetworkView || m.showSSHConfigXfer || m.showSSHPathPrompt || m.showSSHPostWriteConfirm {
+				return m, nil
+			}
+			sel := m.current()
+			if sel == nil {
+				m.setStatus("ssh edit: no host selected", 2000)
+				return m, nil
+			}
+			alias := strings.TrimSpace(sel.Resolved.Host.Name)
+			if alias == "" {
+				m.setStatus("ssh edit: empty host alias", 2000)
+				return m, nil
+			}
+
+			// Resolve the defining file + line for this alias.
+			target := ""
+			line := 0
+			if entries, err := LoadSSHConfigDefault(); err == nil && len(entries) > 0 {
+				for _, e := range entries {
+					if strings.TrimSpace(e.Alias) != alias {
+						continue
+					}
+					// Prefer the first (earliest) defining occurrence so the user sees the
+					// config block that actually introduced the alias (Includes supported).
+					if strings.TrimSpace(e.Source) != "" && e.StartLine > 0 {
+						target = strings.TrimSpace(e.Source)
+						line = e.StartLine
+						break
+					}
+				}
+			}
+
+			// Fallback to primary ~/.ssh/config if we couldn't locate a specific source/line.
+			if strings.TrimSpace(target) == "" {
+				if p, err := LoadSSHConfigPrimaryPath(); err == nil {
+					target = p
+				} else {
+					target = filepath.Join(os.Getenv("HOME"), ".ssh", "config")
+				}
+			}
+			target = expandUserAndEnv(strings.TrimSpace(target))
+
+			// Hardcode a safe terminal editor.
+			editor := "vi"
+
+			// Build an editor invocation that jumps to the line when known.
+			argv := []string{}
+			if line > 0 {
+				argv = []string{fmt.Sprintf("+%d", line), target}
+			} else {
+				argv = []string{target}
+			}
+
+			// Best-effort: restore terminal state before launching the editor.
+			restoreTerminalForExec()
+
+			if strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_IN_POPUP")) == "1" {
+				cmd := exec.Command(editor, argv...)
+				cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+				if line > 0 {
+					m.setStatus(fmt.Sprintf("ssh edit: opening %s:%d...", target, line), 2000)
+				} else {
+					m.setStatus(fmt.Sprintf("ssh edit: opening %s...", target), 2000)
+				}
+				return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
+					if err != nil {
+						return errMsg{Err: fmt.Errorf("ssh edit: %w", err)}
+					}
+					return statusMsg("ssh edit: editor closed")
+				})
+			}
+
+			// Non-popup: run editor inside a new tmux split.
+			// Use a shell command to support `vi +<line> <file>` form cleanly.
+			cmdline := ""
+			if line > 0 {
+				cmdline = fmt.Sprintf("exec %s +%d %q", editor, line, target)
+			} else {
+				cmdline = fmt.Sprintf("exec %s %q", editor, target)
+			}
+			cmd := exec.Command("tmux", "split-window", "-v", "-c", "#{pane_current_path}", "bash", "-lc", cmdline)
+			cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+			if err := cmd.Run(); err != nil {
+				m.setStatus(fmt.Sprintf("ssh edit: %v", err), 3500)
+				return m, nil
+			}
+			m.setStatus("ssh edit: editor closed", 1500)
+			return m, tea.ClearScreen
+
 		case "S":
 			// Host Settings overlay (SecureCRT-like session properties)
 			m.pendingG = false
@@ -5963,7 +6064,7 @@ func (m model) View() string {
 	if m.recording {
 		recState = "ON"
 	}
-	b.WriteString(fmt.Sprintf("\nKeys: j/k move • / search • ? reverse • Enter connect • Space multi • S host settings • E ssh-export • I ssh-import • M merge-dups • :menu • :help • q quit   |   managed panes: %d   |   REC: %s\n", managed, recState))
+	b.WriteString(fmt.Sprintf("\nKeys: j/k move • / search • ? reverse • Enter connect • Space multi • e edit-ssh • S host settings • E ssh-export • I ssh-import • M merge-dups • :menu • :help • q quit   |   managed panes: %d   |   REC: %s\n", managed, recState))
 
 	return b.String()
 }
