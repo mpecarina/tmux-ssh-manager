@@ -178,6 +178,32 @@ type model struct {
 	addSSHIdentityFile textinput.Model
 	addSSHForwardAgent bool // default true
 
+	// --- SSH config import/export selection modal ---
+	// Provides a menu to select literal Host aliases from ~/.ssh/config for:
+	// - Export: write a new ssh config file containing only the selected hosts
+	// - Import: merge/update-by-name into tmux-ssh-manager YAML config (hosts.yaml)
+	showSSHConfigXfer     bool
+	sshXferMode           string // "export" | "import"
+	sshXferEntries        []SSHHostEntry
+	sshXferFilteredIdx    []int            // indices into sshXferEntries (after xfer query filter)
+	sshXferSelectedSet    map[int]struct{} // selected indices into sshXferEntries
+	sshXferSelectedCursor int
+	sshXferScroll         int
+	sshXferQuery          textinput.Model
+	sshXferStatus         string
+
+	// Path prompt modal (used for both ssh export and ssh import)
+	showSSHPathPrompt bool
+	sshPathMode       string // "export" | "import"
+	sshPathInput      textinput.Model
+	sshPathHint       string
+
+	// After import/export, offer to open an editor to review the written file.
+	// This mirrors the UX used elsewhere (e.g. editing ~/.ssh/config via Ctrl+E in Add Host).
+	showSSHPostWriteConfirm bool
+	sshPostWritePath        string
+	sshPostWriteAction      string // "export" | "import"
+
 	// Add SSH Host modal "command mode" (vim-ish):
 	// - default is insert mode (cmd mode OFF): digits/0/g/G are inserted into fields
 	// - when cmd mode ON: 0/g/G and numeric jumps are navigation shortcuts
@@ -275,10 +301,10 @@ func newModel(cfg *Config, opts UIOptions) model {
 	ui.Placeholder = "optional"
 	ui.CharLimit = 128
 
-	pi := textinput.New()
-	pi.Prompt = "Port: "
-	pi.Placeholder = "optional (default 22)"
-	pi.CharLimit = 16
+	porti := textinput.New()
+	porti.Prompt = "Port: "
+	porti.Placeholder = "optional (default 22)"
+	porti.CharLimit = 16
 
 	pji := textinput.New()
 	pji.Prompt = "ProxyJump: "
@@ -310,6 +336,18 @@ func newModel(cfg *Config, opts UIOptions) model {
 	nqi.Prompt = "find: "
 	nqi.Placeholder = "name or ip..."
 	nqi.CharLimit = 256
+
+	// SSH config xfer quick-search input (within import/export modal)
+	xqi := textinput.New()
+	xqi.Prompt = "ssh: "
+	xqi.Placeholder = "filter hosts..."
+	xqi.CharLimit = 256
+
+	// SSH import/export path prompt input (absolute or relative to cwd)
+	pi := textinput.New()
+	pi.Prompt = "path: "
+	pi.Placeholder = "absolute or relative (cwd)"
+	pi.CharLimit = 1024
 
 	cands := buildCandidates(cfg)
 	m := model{
@@ -355,13 +393,35 @@ func newModel(cfg *Config, opts UIOptions) model {
 		// SSH config duplicate map
 		dupAliasCount: make(map[string]int),
 
+		// SSH config import/export modal defaults
+		showSSHConfigXfer:     false,
+		sshXferMode:           "",
+		sshXferEntries:        nil,
+		sshXferFilteredIdx:    nil,
+		sshXferSelectedSet:    make(map[int]struct{}),
+		sshXferSelectedCursor: 0,
+		sshXferScroll:         0,
+		sshXferQuery:          xqi,
+		sshXferStatus:         "",
+
+		// SSH path prompt defaults
+		showSSHPathPrompt: false,
+		sshPathMode:       "",
+		sshPathInput:      pi,
+		sshPathHint:       "",
+
+		// Post-write confirm defaults
+		showSSHPostWriteConfirm: false,
+		sshPostWritePath:        "",
+		sshPostWriteAction:      "",
+
 		// Add SSH Host modal defaults
 		showAddSSHHost:     false,
 		addSSHFieldSel:     0,
 		addSSHAlias:        ai,
 		addSSHHostName:     hni,
 		addSSHUser:         ui,
-		addSSHPort:         pi,
+		addSSHPort:         porti,
 		addSSHProxyJump:    pji,
 		addSSHIdentityFile: idi,
 		addSSHForwardAgent: true,
@@ -455,6 +515,16 @@ func (m *model) buildCmdCandidates() []string {
 		"dash apply-file ",
 		"dashboard",
 		"dashboards",
+
+		// SSH config import/export (OpenSSH ~/.ssh/config)
+		// - :ssh export -> select hosts from ~/.ssh/config and export them
+		// - :ssh import -> select hosts from ~/.ssh/config and import them
+		"ssh",
+		"ssh ",
+		"ssh export",
+		"ssh export ",
+		"ssh import",
+		"ssh import ",
 
 		// Send commands (records cleanly + works for NOC dashboards).
 		"send ",
@@ -940,6 +1010,582 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.netQuery, cmd = m.netQuery.Update(msg)
 						return m, cmd
 					}
+				}
+			}
+		}
+
+		// Post-write confirm modal: offer to open editor to review the written file.
+		if m.showSSHPostWriteConfirm {
+			switch msg.String() {
+			case "q", "esc":
+				m.showSSHPostWriteConfirm = false
+				m.sshPostWritePath = ""
+				m.sshPostWriteAction = ""
+				return m, tea.ClearScreen
+			case "enter", "y":
+				// Open the written file in vi, mirroring the Ctrl+E editor mechanism used elsewhere.
+				path := strings.TrimSpace(m.sshPostWritePath)
+				if path == "" {
+					m.setStatus("ssh: nothing to edit (empty path)", 2500)
+					m.showSSHPostWriteConfirm = false
+					return m, tea.ClearScreen
+				}
+
+				// Close confirm modal before launching editor.
+				m.showSSHPostWriteConfirm = false
+				m.sshPostWritePath = ""
+				m.sshPostWriteAction = ""
+
+				// Hardcode a safe terminal editor.
+				editor := "vi"
+
+				// Best-effort: restore terminal state before launching the editor.
+				restoreTerminalForExec()
+
+				if strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_IN_POPUP")) == "1" {
+					cmd := exec.Command(editor, path)
+					cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+					m.setStatus("ssh: opening vi...", 1500)
+					return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
+						if err != nil {
+							return errMsg{Err: fmt.Errorf("edit ssh file: %w", err)}
+						}
+						return statusMsg("ssh: editor closed")
+					})
+				}
+
+				cmdline := fmt.Sprintf("exec %s %q", editor, path)
+				cmd := exec.Command("tmux", "split-window", "-v", "-c", "#{pane_current_path}", "bash", "-lc", cmdline)
+				cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+				if err := cmd.Run(); err != nil {
+					m.setStatus(fmt.Sprintf("edit ssh file: %v", err), 3500)
+					return m, tea.ClearScreen
+				}
+				m.setStatus("ssh: editor closed", 1500)
+				return m, tea.ClearScreen
+			default:
+				return m, nil
+			}
+		}
+
+		// SSH path prompt modal (absolute or relative path).
+		if m.showSSHPathPrompt {
+			switch msg.String() {
+			case "q", "esc":
+				m.showSSHPathPrompt = false
+				m.sshPathMode = ""
+				m.sshPathInput.SetValue("")
+				m.sshPathInput.Blur()
+				m.sshPathHint = ""
+				m.setStatus("ssh: path prompt cancelled", 1200)
+				return m, tea.ClearScreen
+
+			case "enter":
+				// Confirm path and proceed to the write/apply action.
+				// Path can be absolute or relative to cwd.
+				p := strings.TrimSpace(m.sshPathInput.Value())
+				if p == "" {
+					m.setStatus("ssh: path is required", 2500)
+					return m, nil
+				}
+
+				mode := strings.ToLower(strings.TrimSpace(m.sshPathMode))
+				m.showSSHPathPrompt = false
+				m.sshPathMode = ""
+				m.sshPathInput.Blur()
+				m.sshPathHint = ""
+
+				// Resolve to absolute if relative (cwd).
+				if !filepath.IsAbs(p) {
+					if cwd, err := os.Getwd(); err == nil && strings.TrimSpace(cwd) != "" {
+						p = filepath.Join(cwd, p)
+					}
+				}
+
+				// Build alias set from selected indices (from xfer modal selection).
+				aliasSet := make(map[string]struct{}, len(m.sshXferSelectedSet))
+				for idx := range m.sshXferSelectedSet {
+					if idx < 0 || idx >= len(m.sshXferEntries) {
+						continue
+					}
+					a := strings.TrimSpace(m.sshXferEntries[idx].Alias)
+					if a != "" {
+						aliasSet[a] = struct{}{}
+					}
+				}
+				if len(aliasSet) == 0 {
+					m.setStatus("ssh: selection is empty (no valid aliases)", 3500)
+					return m, tea.ClearScreen
+				}
+
+				switch mode {
+				case "export":
+					n, err := ExportSSHConfigSelected(m.sshXferEntries, aliasSet, p)
+					if err != nil {
+						m.setStatus(fmt.Sprintf("ssh export failed: %v", err), 4000)
+						return m, tea.ClearScreen
+					}
+
+					// Close selector after successful export.
+					m.showSSHConfigXfer = false
+					m.sshXferMode = ""
+					m.sshXferEntries = nil
+					m.sshXferFilteredIdx = nil
+					m.sshXferSelectedSet = make(map[int]struct{})
+					m.sshXferSelectedCursor = 0
+					m.sshXferScroll = 0
+					m.sshXferQuery.SetValue("")
+					m.sshXferQuery.Blur()
+					m.sshXferStatus = ""
+
+					// Offer to open editor.
+					m.showSSHPostWriteConfirm = true
+					m.sshPostWritePath = p
+					m.sshPostWriteAction = "export"
+
+					m.setStatus(fmt.Sprintf("ssh export: wrote %d host(s) to %s", n, p), 4500)
+					return m, tea.ClearScreen
+
+				case "import":
+					// Import: merge/update selected hosts into the target ssh config file.
+					// Path can be the primary ~/.ssh/config or any other ssh config file path.
+					//
+					// Semantics (merge/update by alias):
+					// - If the Host alias exists in the file, update its settings (HostName/User/Port/ProxyJump/ForwardAgent/IdentityFile)
+					//   using values derived from the parsed entries for that alias.
+					// - If the alias does not exist, append a new Host block.
+					// - Write atomically with a .bak backup (same behavior as other sshconfig writers).
+					//
+					// NOTE: This does not import into tmux-ssh-manager YAML; it edits an OpenSSH config file.
+					targetPath := strings.TrimSpace(p)
+					if targetPath == "" {
+						m.setStatus("ssh import: empty target path", 3500)
+						return m, tea.ClearScreen
+					}
+
+					// Load/parse the target ssh config file if present; else start empty.
+					targetPath = expandUserAndEnv(targetPath)
+					if ap, err := filepath.Abs(targetPath); err == nil {
+						targetPath = ap
+					}
+					var fileLines []string
+					if data, rerr := os.ReadFile(targetPath); rerr == nil {
+						txt := strings.ReplaceAll(string(data), "\r\n", "\n")
+						txt = strings.ReplaceAll(txt, "\r", "\n")
+						parts := strings.Split(txt, "\n")
+						if len(parts) > 0 && parts[len(parts)-1] == "" {
+							parts = parts[:len(parts)-1]
+						}
+						fileLines = parts
+					} else if os.IsNotExist(rerr) {
+						fileLines = []string{}
+					} else if rerr != nil {
+						m.setStatus(fmt.Sprintf("ssh import: read %s failed: %v", targetPath, rerr), 4000)
+						return m, tea.ClearScreen
+					}
+
+					// Parse target file into structured blocks (so we can update existing Host blocks).
+					// We parse ONLY this file (no Includes) because we are writing back to this file path.
+					sf, perr := LoadSSHConfig(targetPath)
+					_ = sf
+					_ = perr
+					// We still need a structured parse for block spans; use parseSSHConfigRecursive on just this file.
+					// Best-effort: if parsing fails, we will fall back to appending blocks.
+					var structured *SSHConfigFile
+					{
+						abs := targetPath
+						entries, err := parseSSHConfigRecursive(abs, map[string]struct{}{})
+						if err == nil {
+							// Reconstruct a minimal "structured" view by reloading the file and building blocks
+							// using the existing structured loader (which relies on the same file on disk).
+							// NOTE: parseSSHConfigRecursive returns host entries only.
+							_ = entries
+							if sf2, serr := LoadSSHConfigPrimaryStructured(); serr == nil && sf2 != nil {
+								// Only use it if it's actually the same file path.
+								if strings.TrimSpace(sf2.Path) == strings.TrimSpace(abs) {
+									structured = sf2
+									fileLines = sf2.Lines
+								}
+							}
+						}
+					}
+
+					// Build selected alias list deterministically.
+					aliases := make([]string, 0, len(aliasSet))
+					for a := range aliasSet {
+						a = strings.TrimSpace(a)
+						if a != "" {
+							aliases = append(aliases, a)
+						}
+					}
+					sort.Strings(aliases)
+
+					updated := 0
+					added := 0
+
+					// Helper: build settings map from the parsed entry for an alias.
+					buildSettingsForAlias := func(alias string) map[string][]string {
+						settings := map[string][]string{}
+						// Start with defaults from the selected entries (last-wins for scalars; identityfiles accumulate).
+						hostName := ""
+						user := ""
+						port := 0
+						proxyJump := ""
+						var forwardAgent *bool
+						idFiles := []string(nil)
+
+						addUnique := func(dst []string, v string) []string {
+							v = strings.TrimSpace(v)
+							if v == "" {
+								return dst
+							}
+							for _, e := range dst {
+								if e == v {
+									return dst
+								}
+							}
+							return append(dst, v)
+						}
+
+						for _, e := range m.sshXferEntries {
+							if strings.TrimSpace(e.Alias) != alias {
+								continue
+							}
+							if strings.TrimSpace(e.HostName) != "" {
+								hostName = strings.TrimSpace(e.HostName)
+							}
+							if strings.TrimSpace(e.User) != "" {
+								user = strings.TrimSpace(e.User)
+							}
+							if e.Port > 0 {
+								port = e.Port
+							}
+							if strings.TrimSpace(e.ProxyJump) != "" {
+								proxyJump = strings.TrimSpace(e.ProxyJump)
+							}
+							if e.ForwardAgent != nil {
+								b := *e.ForwardAgent
+								forwardAgent = &b
+							}
+							for _, id := range e.IdentityFiles {
+								idFiles = addUnique(idFiles, id)
+							}
+						}
+
+						// Always write HostName (default to alias if empty) for predictability.
+						if strings.TrimSpace(hostName) == "" {
+							hostName = alias
+						}
+						settings["hostname"] = []string{hostName}
+
+						if strings.TrimSpace(user) != "" {
+							settings["user"] = []string{user}
+						}
+						if port > 0 {
+							settings["port"] = []string{strconv.Itoa(port)}
+						}
+						if strings.TrimSpace(proxyJump) != "" {
+							settings["proxyjump"] = []string{proxyJump}
+						}
+						if forwardAgent != nil {
+							if *forwardAgent {
+								settings["forwardagent"] = []string{"yes"}
+							} else {
+								settings["forwardagent"] = []string{"no"}
+							}
+						}
+						if len(idFiles) > 0 {
+							settings["identityfile"] = append([]string(nil), idFiles...)
+						}
+						return settings
+					}
+
+					// Helper: find last literal Host block for alias in the structured file.
+					findLastAliasBlock := func(alias string) *SSHConfigBlock {
+						if structured == nil {
+							return nil
+						}
+						var last *SSHConfigBlock
+						for i := range structured.Blocks {
+							b := structured.Blocks[i]
+							for _, pat := range b.Patterns {
+								if strings.TrimSpace(pat) == alias {
+									last = &structured.Blocks[i]
+									break
+								}
+							}
+						}
+						return last
+					}
+
+					// Apply updates/appends.
+					for _, alias := range aliases {
+						settings := buildSettingsForAlias(alias)
+						if len(settings) == 0 {
+							continue
+						}
+
+						if b := findLastAliasBlock(alias); b != nil && b.StartLine > 0 && b.EndLine >= b.StartLine {
+							// Replace the last matching block in-place.
+							indent := detectSSHIndent(fileLines)
+							repl := renderSSHHostBlockLines([]string{alias}, settings, indent)
+							// StartLine/EndLine are 1-based; spliceLines is 0-based inclusive.
+							fileLines = spliceLines(fileLines, b.StartLine-1, b.EndLine-1, repl)
+							updated++
+							// Re-parse best-effort so subsequent edits operate on current spans.
+							entries, err := parseSSHConfigRecursive(targetPath, map[string]struct{}{})
+							if err == nil {
+								// parseSSHConfigRecursive returns entries only; we keep fileLines as-is.
+								_ = entries
+							}
+							continue
+						}
+
+						// Not found: append a new block.
+						indent := "  "
+						if len(fileLines) > 0 {
+							indent = detectSSHIndent(fileLines)
+							if strings.TrimSpace(fileLines[len(fileLines)-1]) != "" {
+								fileLines = append(fileLines, "")
+							}
+						}
+						fileLines = append(fileLines, renderSSHHostBlockLines([]string{alias}, settings, indent)...)
+						fileLines = append(fileLines, "")
+						added++
+						// Re-parse best-effort for subsequent lookups.
+						entries, err := parseSSHConfigRecursive(targetPath, map[string]struct{}{})
+						if err == nil {
+							// parseSSHConfigRecursive returns entries only; we keep fileLines as-is.
+							_ = entries
+						}
+					}
+
+					if err := os.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
+						m.setStatus(fmt.Sprintf("ssh import: create dir failed: %v", err), 4000)
+						return m, tea.ClearScreen
+					}
+					if err := writeSSHConfigAtomicWithBackup(targetPath, fileLines); err != nil {
+						m.setStatus(fmt.Sprintf("ssh import: write failed: %v", err), 4000)
+						return m, tea.ClearScreen
+					}
+
+					// Close selector after successful import.
+					m.showSSHConfigXfer = false
+					m.sshXferMode = ""
+					m.sshXferEntries = nil
+					m.sshXferFilteredIdx = nil
+					m.sshXferSelectedSet = make(map[int]struct{})
+					m.sshXferSelectedCursor = 0
+					m.sshXferScroll = 0
+					m.sshXferQuery.SetValue("")
+					m.sshXferQuery.Blur()
+					m.sshXferStatus = ""
+
+					// Offer to open editor to review the modified ssh config.
+					m.showSSHPostWriteConfirm = true
+					m.sshPostWritePath = targetPath
+					m.sshPostWriteAction = "import"
+
+					m.setStatus(fmt.Sprintf("ssh import: %d added, %d updated -> %s", added, updated, targetPath), 5000)
+					return m, tea.ClearScreen
+
+				default:
+					m.setStatus("ssh: invalid path mode", 2500)
+					return m, tea.ClearScreen
+				}
+
+			default:
+				m.sshPathInput.Focus()
+				var cmd tea.Cmd
+				m.sshPathInput, cmd = m.sshPathInput.Update(msg)
+				return m, cmd
+			}
+		}
+
+		// SSH config import/export modal: highest priority within normal UI (after global keys).
+		if m.showSSHConfigXfer {
+			switch msg.String() {
+			case "q":
+				// In this modal, q should cancel/close (never quit the whole program).
+				m.showSSHConfigXfer = false
+				m.sshXferMode = ""
+				m.sshXferEntries = nil
+				m.sshXferFilteredIdx = nil
+				m.sshXferSelectedSet = make(map[int]struct{})
+				m.sshXferSelectedCursor = 0
+				m.sshXferScroll = 0
+				m.sshXferQuery.SetValue("")
+				m.sshXferQuery.Blur()
+				m.sshXferStatus = ""
+				m.setStatus("ssh xfer: cancelled", 1200)
+				return m, tea.ClearScreen
+
+			case "esc":
+				// Toggle filter focus
+				if m.sshXferQuery.Focused() {
+					m.sshXferQuery.Blur()
+				} else {
+					m.sshXferQuery.Focus()
+				}
+				return m, nil
+
+			case "/":
+				m.sshXferQuery.Focus()
+				return m, nil
+
+			case "ctrl+a":
+				// Quick select all (within the current filtered set if present; else all entries).
+				if len(m.sshXferFilteredIdx) > 0 {
+					for _, idx := range m.sshXferFilteredIdx {
+						m.sshXferSelectedSet[idx] = struct{}{}
+					}
+					m.sshXferStatus = fmt.Sprintf("selected %d (filtered)", len(m.sshXferSelectedSet))
+				} else {
+					for i := range m.sshXferEntries {
+						m.sshXferSelectedSet[i] = struct{}{}
+					}
+					m.sshXferStatus = fmt.Sprintf("selected %d", len(m.sshXferSelectedSet))
+				}
+				return m, nil
+
+			case "ctrl+d":
+				// Clear selection
+				m.sshXferSelectedSet = make(map[int]struct{})
+				m.sshXferStatus = "selection cleared"
+				return m, nil
+
+			case "enter", " ":
+				// Toggle selection on the current cursor row.
+				idx := -1
+				if len(m.sshXferFilteredIdx) > 0 {
+					if m.sshXferSelectedCursor >= 0 && m.sshXferSelectedCursor < len(m.sshXferFilteredIdx) {
+						idx = m.sshXferFilteredIdx[m.sshXferSelectedCursor]
+					}
+				} else {
+					if m.sshXferSelectedCursor >= 0 && m.sshXferSelectedCursor < len(m.sshXferEntries) {
+						idx = m.sshXferSelectedCursor
+					}
+				}
+				if idx >= 0 && idx < len(m.sshXferEntries) {
+					if _, ok := m.sshXferSelectedSet[idx]; ok {
+						delete(m.sshXferSelectedSet, idx)
+					} else {
+						m.sshXferSelectedSet[idx] = struct{}{}
+					}
+					m.sshXferStatus = fmt.Sprintf("selected %d", len(m.sshXferSelectedSet))
+				}
+				return m, nil
+
+			case "j", "down":
+				// Move cursor down (bounded)
+				maxN := len(m.sshXferEntries)
+				if len(m.sshXferFilteredIdx) > 0 {
+					maxN = len(m.sshXferFilteredIdx)
+				}
+				if maxN <= 0 {
+					return m, nil
+				}
+				if m.sshXferSelectedCursor < maxN-1 {
+					m.sshXferSelectedCursor++
+				}
+				m.pendingG = false
+				m.numBuf = ""
+				return m, nil
+
+			case "k", "up":
+				// Move cursor up (bounded)
+				maxN := len(m.sshXferEntries)
+				if len(m.sshXferFilteredIdx) > 0 {
+					maxN = len(m.sshXferFilteredIdx)
+				}
+				if maxN <= 0 {
+					return m, nil
+				}
+				if m.sshXferSelectedCursor > 0 {
+					m.sshXferSelectedCursor--
+				}
+				m.pendingG = false
+				m.numBuf = ""
+				return m, nil
+
+			case "g":
+				// Vim-ish: gg to top
+				if m.pendingG {
+					m.sshXferSelectedCursor = 0
+					m.pendingG = false
+					m.numBuf = ""
+					return m, nil
+				}
+				m.pendingG = true
+				m.numBuf = ""
+				return m, nil
+
+			case "G":
+				// Vim-ish: G to bottom
+				maxN := len(m.sshXferEntries)
+				if len(m.sshXferFilteredIdx) > 0 {
+					maxN = len(m.sshXferFilteredIdx)
+				}
+				if maxN > 0 {
+					m.sshXferSelectedCursor = maxN - 1
+				}
+				m.pendingG = false
+				m.numBuf = ""
+				return m, nil
+
+			case "e":
+				// Export: prompt for output path (absolute or relative to cwd)
+				if strings.ToLower(strings.TrimSpace(m.sshXferMode)) != "export" {
+					m.setStatus("ssh xfer: not in export mode", 2000)
+					return m, nil
+				}
+				if len(m.sshXferSelectedSet) == 0 {
+					m.setStatus("ssh export: nothing selected (use Space/Enter to select, ctrl+a for all)", 3500)
+					return m, nil
+				}
+				m.showSSHPathPrompt = true
+				m.sshPathMode = "export"
+				m.sshPathHint = "Enter output path (abs or relative to cwd)"
+				// Pre-fill with the previous default for convenience.
+				def := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_SSH_EXPORT_PATH"))
+				if def == "" {
+					if cfgDir, derr := DefaultConfigDir(); derr == nil && strings.TrimSpace(cfgDir) != "" {
+						def = filepath.Join(cfgDir, "sshconfig.exported")
+					}
+				}
+				m.sshPathInput.SetValue(def)
+				m.sshPathInput.Focus()
+				return m, tea.ClearScreen
+
+			case "i":
+				// Import: prompt for target ssh config path (abs or relative to cwd).
+				// Default: primary OpenSSH config (~/.ssh/config).
+				if strings.ToLower(strings.TrimSpace(m.sshXferMode)) != "import" {
+					m.setStatus("ssh xfer: not in import mode", 2000)
+					return m, nil
+				}
+				if len(m.sshXferSelectedSet) == 0 {
+					m.setStatus("ssh import: nothing selected (use Space/Enter to select, ctrl+a for all)", 3500)
+					return m, nil
+				}
+				m.showSSHPathPrompt = true
+				m.sshPathMode = "import"
+				m.sshPathHint = "Enter target ssh config path (abs or relative to cwd)"
+				def, err := LoadSSHConfigPrimaryPath()
+				if err != nil || strings.TrimSpace(def) == "" {
+					def = filepath.Join(os.Getenv("HOME"), ".ssh", "config")
+				}
+				m.sshPathInput.SetValue(def)
+				m.sshPathInput.Focus()
+				return m, tea.ClearScreen
+
+			default:
+				// If filter input is focused, let it consume keystrokes.
+				if m.sshXferQuery.Focused() {
+					var cmd tea.Cmd
+					m.sshXferQuery, cmd = m.sshXferQuery.Update(msg)
+					// Note: filtering logic is handled elsewhere; this modal just captures input state.
+					return m, cmd
 				}
 			}
 		}
@@ -2210,6 +2856,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							"Recorder: :record start <name> [desc...] • :record stop • :record save [name] • :record delete <name> • :record status\n"+
 							"Host: S settings • :login manual|askpass|status • :cred status|set|delete\n"+
 							"Logs: l viewer • O pager • T toggle logging policy • :logs • :log toggle|on|off\n"+
+							"SSH config: E export selector • I import selector • :ssh export • :ssh import\n"+
 							"Other: y yank • Y yank-all • :run <macro> [split v|split h|window|connect] • q quit\n"+
 							"tmux: prefix+w choose-window • prefix+n/p next/prev",
 						12000,
@@ -2223,6 +2870,60 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case "q", "quit", "exit":
 					m.quitting = true
 					return m.quit()
+
+				case "ssh":
+					// :ssh export -> open SSH export selector (from ~/.ssh/config)
+					// :ssh import -> open SSH import selector (from ~/.ssh/config)
+					//
+					// NOTE: The actual export/import actions are triggered from within the modal
+					// (currently placeholders), but this wires the command bar entry points.
+					sub := strings.ToLower(strings.TrimSpace(rest))
+					if strings.HasPrefix(sub, "export") {
+						entries, err := LoadSSHConfigDefault()
+						if err != nil {
+							m.setStatus(fmt.Sprintf("ssh export: load ~/.ssh/config failed: %v", err), 3500)
+							return m, tea.ClearScreen
+						}
+						m.showSSHConfigXfer = true
+						m.sshXferMode = "export"
+						m.sshXferEntries = entries
+						m.sshXferFilteredIdx = nil
+						m.sshXferSelectedSet = make(map[int]struct{})
+						m.sshXferSelectedCursor = 0
+						m.sshXferScroll = 0
+						m.sshXferQuery.SetValue("")
+						m.sshXferQuery.Blur()
+						m.sshXferStatus = "Space/Enter select • ctrl+a all • ctrl+d clear • / filter • q close"
+						m.input.Blur()
+						m.showHelp = false
+						m.pendingG = false
+						m.numBuf = ""
+						return m, tea.ClearScreen
+					}
+					if strings.HasPrefix(sub, "import") {
+						entries, err := LoadSSHConfigDefault()
+						if err != nil {
+							m.setStatus(fmt.Sprintf("ssh import: load ~/.ssh/config failed: %v", err), 3500)
+							return m, tea.ClearScreen
+						}
+						m.showSSHConfigXfer = true
+						m.sshXferMode = "import"
+						m.sshXferEntries = entries
+						m.sshXferFilteredIdx = nil
+						m.sshXferSelectedSet = make(map[int]struct{})
+						m.sshXferSelectedCursor = 0
+						m.sshXferScroll = 0
+						m.sshXferQuery.SetValue("")
+						m.sshXferQuery.Blur()
+						m.sshXferStatus = "Space/Enter select • ctrl+a all • ctrl+d clear • / filter • q close"
+						m.input.Blur()
+						m.showHelp = false
+						m.pendingG = false
+						m.numBuf = ""
+						return m, tea.ClearScreen
+					}
+					m.setStatus("Usage: :ssh export | :ssh import", 3500)
+					return m, tea.ClearScreen
 
 				case "search", "/":
 					m.searchForward = true
@@ -3914,6 +4615,60 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.hostSettingsSel = 0
 			return m, tea.ClearScreen
 
+		case "E":
+			// SSH config export selector (from ~/.ssh/config)
+			// Opens a modal to multi-select hosts and export a new ssh config containing only those entries.
+			if m.showHelp || m.showLogs || m.showDashBrowser || m.showCmdline || m.showHostSettings || m.showAddSSHHost || m.showMergeDupsConfirm || m.showRouterIDEditor || m.showMgmtIPEditor || m.showDeviceOSEditor || m.showNetworkView {
+				return m, nil
+			}
+			entries, err := LoadSSHConfigDefault()
+			if err != nil {
+				m.setStatus(fmt.Sprintf("ssh export: load ~/.ssh/config failed: %v", err), 3500)
+				return m, nil
+			}
+			m.showSSHConfigXfer = true
+			m.sshXferMode = "export"
+			m.sshXferEntries = entries
+			m.sshXferFilteredIdx = nil
+			m.sshXferSelectedSet = make(map[int]struct{})
+			m.sshXferSelectedCursor = 0
+			m.sshXferScroll = 0
+			m.sshXferQuery.SetValue("")
+			m.sshXferQuery.Blur()
+			m.sshXferStatus = "Space/Enter select • ctrl+a all • ctrl+d clear • / filter • q close"
+			m.input.Blur()
+			m.showHelp = false
+			m.pendingG = false
+			m.numBuf = ""
+			return m, tea.ClearScreen
+
+		case "I":
+			// SSH config import selector (from ~/.ssh/config)
+			// Opens a modal to multi-select hosts for import flow.
+			if m.showHelp || m.showLogs || m.showDashBrowser || m.showCmdline || m.showHostSettings || m.showAddSSHHost || m.showMergeDupsConfirm || m.showRouterIDEditor || m.showMgmtIPEditor || m.showDeviceOSEditor || m.showNetworkView {
+				return m, nil
+			}
+			entries, err := LoadSSHConfigDefault()
+			if err != nil {
+				m.setStatus(fmt.Sprintf("ssh import: load ~/.ssh/config failed: %v", err), 3500)
+				return m, nil
+			}
+			m.showSSHConfigXfer = true
+			m.sshXferMode = "import"
+			m.sshXferEntries = entries
+			m.sshXferFilteredIdx = nil
+			m.sshXferSelectedSet = make(map[int]struct{})
+			m.sshXferSelectedCursor = 0
+			m.sshXferScroll = 0
+			m.sshXferQuery.SetValue("")
+			m.sshXferQuery.Blur()
+			m.sshXferStatus = "Space/Enter select • ctrl+a all • ctrl+d clear • / filter • q close"
+			m.input.Blur()
+			m.showHelp = false
+			m.pendingG = false
+			m.numBuf = ""
+			return m, tea.ClearScreen
+
 		case "T":
 			// Toggle per-host logging policy (default ON unless explicitly disabled).
 			// Persisted to: ~/.config/tmux-ssh-manager/hosts/<hostkey>.conf as `logging=true|false`.
@@ -4642,6 +5397,177 @@ func (m model) View() string {
 		return b.String()
 	}
 
+	// Post-write confirm modal (open editor?)
+	if m.showSSHPostWriteConfirm {
+		title := "SSH"
+		if strings.TrimSpace(m.sshPostWriteAction) == "export" {
+			title = "SSH Export"
+		} else if strings.TrimSpace(m.sshPostWriteAction) == "import" {
+			title = "SSH Import"
+		}
+		b.WriteString(m.theme.HeaderLine(title+" - Review") + "\n")
+		b.WriteString(m.theme.apply(m.theme.Separator, strings.Repeat("-", maxInt(6, minInt(m.width, 70)))) + "\n")
+		b.WriteString(fmt.Sprintf("Wrote: %s\n\n", strings.TrimSpace(m.sshPostWritePath)))
+		b.WriteString(m.theme.apply(m.theme.Dim, "Open in editor now? (Enter/y = yes, q/esc = no)") + "\n")
+		return b.String()
+	}
+
+	// SSH path prompt modal
+	if m.showSSHPathPrompt {
+		title := "SSH Path"
+		if strings.TrimSpace(m.sshPathMode) == "export" {
+			title = "SSH Export Path"
+		} else if strings.TrimSpace(m.sshPathMode) == "import" {
+			title = "SSH Import Path"
+		}
+		b.WriteString(m.theme.HeaderLine(title) + "\n")
+		b.WriteString(m.theme.apply(m.theme.Separator, strings.Repeat("-", maxInt(6, minInt(m.width, 70)))) + "\n")
+		if strings.TrimSpace(m.sshPathHint) != "" {
+			b.WriteString(m.theme.apply(m.theme.Dim, m.sshPathHint) + "\n")
+		}
+		b.WriteString("\n")
+		b.WriteString(fmt.Sprintf("%s\n\n", m.sshPathInput.View()))
+		b.WriteString(m.theme.apply(m.theme.Dim, "Enter confirm • Esc/q cancel • absolute or relative (cwd)") + "\n")
+		return b.String()
+	}
+
+	// SSH config import/export selector modal
+	if m.showSSHConfigXfer {
+		mode := strings.ToLower(strings.TrimSpace(m.sshXferMode))
+		title := "SSH Config"
+		if mode == "export" {
+			title = "SSH Config Export (select hosts from ~/.ssh/config)"
+		} else if mode == "import" {
+			title = "SSH Config Import (select hosts from ~/.ssh/config)"
+		} else {
+			title = "SSH Config (select hosts)"
+		}
+
+		b.WriteString(m.theme.HeaderLine(title) + "\n")
+		b.WriteString(m.theme.apply(m.theme.Separator, strings.Repeat("-", maxInt(6, minInt(m.width, 70)))) + "\n")
+
+		// Optional status/help line (non-empty means caller set a hint)
+		if strings.TrimSpace(m.sshXferStatus) != "" {
+			b.WriteString(m.theme.apply(m.theme.Dim, m.sshXferStatus) + "\n")
+		}
+
+		// Filter line
+		q := strings.TrimSpace(m.sshXferQuery.Value())
+		filterLine := "Filter: "
+		if q == "" {
+			filterLine += "(none)  (press / to filter, Esc to focus/blur)"
+		} else {
+			filterLine += q
+		}
+		b.WriteString(m.theme.apply(m.theme.Dim, filterLine) + "\n\n")
+
+		// Build filtered index (case-insensitive substring match against alias and hostname)
+		m.sshXferFilteredIdx = m.sshXferFilteredIdx[:0]
+		lq := strings.ToLower(q)
+		for i, e := range m.sshXferEntries {
+			alias := strings.TrimSpace(e.Alias)
+			hn := strings.TrimSpace(e.HostName)
+			if alias == "" {
+				continue
+			}
+			if lq == "" {
+				m.sshXferFilteredIdx = append(m.sshXferFilteredIdx, i)
+				continue
+			}
+			if strings.Contains(strings.ToLower(alias), lq) || (hn != "" && strings.Contains(strings.ToLower(hn), lq)) {
+				m.sshXferFilteredIdx = append(m.sshXferFilteredIdx, i)
+			}
+		}
+
+		total := len(m.sshXferEntries)
+		visible := len(m.sshXferFilteredIdx)
+		b.WriteString(m.theme.apply(m.theme.Dim, fmt.Sprintf("Hosts: %d total • %d shown • %d selected", total, visible, len(m.sshXferSelectedSet))) + "\n")
+		b.WriteString(m.theme.apply(m.theme.Separator, strings.Repeat("-", maxInt(6, minInt(m.width, 70)))) + "\n")
+
+		// Clamp cursor
+		maxN := visible
+		if maxN < 0 {
+			maxN = 0
+		}
+		if maxN == 0 {
+			b.WriteString(m.theme.apply(m.theme.Dim, "No hosts match the current filter.") + "\n")
+			return b.String()
+		}
+		if m.sshXferSelectedCursor < 0 {
+			m.sshXferSelectedCursor = 0
+		}
+		if m.sshXferSelectedCursor > maxN-1 {
+			m.sshXferSelectedCursor = maxN - 1
+		}
+
+		// Simple scroll window
+		listMax := maxInt(6, m.height-10)
+		if listMax < 3 {
+			listMax = 3
+		}
+		if m.sshXferScroll < 0 {
+			m.sshXferScroll = 0
+		}
+		if m.sshXferSelectedCursor < m.sshXferScroll {
+			m.sshXferScroll = m.sshXferSelectedCursor
+		}
+		if m.sshXferSelectedCursor >= m.sshXferScroll+listMax {
+			m.sshXferScroll = m.sshXferSelectedCursor - listMax + 1
+		}
+		if m.sshXferScroll > maxN-1 {
+			m.sshXferScroll = maxN - 1
+		}
+		end := m.sshXferScroll + listMax
+		if end > maxN {
+			end = maxN
+		}
+
+		for row := m.sshXferScroll; row < end; row++ {
+			idx := m.sshXferFilteredIdx[row]
+			if idx < 0 || idx >= len(m.sshXferEntries) {
+				continue
+			}
+			e := m.sshXferEntries[idx]
+			alias := strings.TrimSpace(e.Alias)
+			hn := strings.TrimSpace(e.HostName)
+
+			cur := "  "
+			if row == m.sshXferSelectedCursor {
+				cur = "> "
+			}
+			sel := "[ ]"
+			if _, ok := m.sshXferSelectedSet[idx]; ok {
+				sel = "[x]"
+			}
+
+			line := fmt.Sprintf("%s%s %s", cur, sel, alias)
+			if hn != "" && hn != alias {
+				line += m.theme.apply(m.theme.Dim, "  ("+hn+")")
+			}
+			// Mark duplicates in primary config if present (best-effort hint)
+			if m.dupAliasCount != nil {
+				if n, ok := m.dupAliasCount[alias]; ok && n > 1 {
+					line += m.theme.apply(m.theme.Warn, fmt.Sprintf("  [dups:%d]", n))
+				}
+			}
+
+			if row == m.sshXferSelectedCursor {
+				b.WriteString(m.theme.apply(m.theme.Selected, line) + "\n")
+			} else {
+				b.WriteString(line + "\n")
+			}
+		}
+
+		b.WriteString("\n")
+		b.WriteString(m.theme.apply(m.theme.Dim, "Keys: j/k move • Space/Enter toggle • ctrl+a select all • ctrl+d clear • / filter • Esc focus/blur • q close") + "\n")
+		if mode == "export" {
+			b.WriteString(m.theme.apply(m.theme.Dim, "Action: press e to export (you will be prompted for a path)") + "\n")
+		} else if mode == "import" {
+			b.WriteString(m.theme.apply(m.theme.Dim, "Action: press i to import (merge/update by name; you will be prompted for a path)") + "\n")
+		}
+		return b.String()
+	}
+
 	// Add SSH Host modal (primary ~/.ssh/config)
 	if m.showAddSSHHost {
 		b.WriteString(m.theme.HeaderLine("Add SSH Host (primary ~/.ssh/config)") + "\n")
@@ -5037,7 +5963,7 @@ func (m model) View() string {
 	if m.recording {
 		recState = "ON"
 	}
-	b.WriteString(fmt.Sprintf("\nKeys: j/k move • / search • ? reverse • Enter connect • Space multi • S host settings • M merge-dups • :menu • :help • q quit   |   managed panes: %d   |   REC: %s\n", managed, recState))
+	b.WriteString(fmt.Sprintf("\nKeys: j/k move • / search • ? reverse • Enter connect • Space multi • S host settings • E ssh-export • I ssh-import • M merge-dups • :menu • :help • q quit   |   managed panes: %d   |   REC: %s\n", managed, recState))
 
 	return b.String()
 }
