@@ -20,15 +20,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// RunTUI launches the Bubble Tea TUI with vim-like motions, incremental search,
-// and tmux-aware actions. It replaces the classic line-oriented TUI.
-// - Vim motions: j/k to move, gg to top, G to bottom, u/d half-page
-// - Enter or c: connect in current pane
-// - v: split vertically (side-by-side) and connect (tmux split-window -h)
-// - s: split horizontally (stacked) and connect (tmux split-window -v)
-// - w: new window and connect
-// - y: yank the ssh command to tmux buffer
-// - /: focus search input; Esc: blur search input; ?: reverse-search; :help (or h): help; q: quit
 func RunTUI(cfg *Config, opts UIOptions) error {
 	if cfg == nil {
 		return fmt.Errorf("nil config")
@@ -37,20 +28,12 @@ func RunTUI(cfg *Config, opts UIOptions) error {
 		opts.MaxResults = 20
 	}
 
-	// When launched from the tmux popup wrapper, force a sane TERM to help Bubble Tea render.
-	// The launcher sets TMUX_SSH_MANAGER_IN_POPUP=1 for popup launches.
-	//
-	// IMPORTANT (popup mode):
-	// Do NOT exec-replace the process with ssh.
-	// Instead, run ssh as a child process so the popup wrapper can capture session output
-	// via macOS `script -a <hostlog>` and then close the popup automatically on exit (-E).
 	if os.Getenv("TMUX_SSH_MANAGER_IN_POPUP") != "" {
 		_ = os.Setenv("TERM", "xterm-256color")
 		opts.ExecReplace = false
 	}
 
 	m := newModel(cfg, opts)
-	// Always force alt-screen for Bubble Tea.
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := p.Run()
 	return err
@@ -84,10 +67,8 @@ type netLLDPDoneMsg struct {
 	Failures map[string]string // host -> error
 }
 
-// statusMsg is a lightweight message for setting a transient UI status line.
 type statusMsg string
 
-// errMsg is a lightweight message for surfacing an error via the status line.
 type errMsg struct {
 	Err error
 }
@@ -106,16 +87,11 @@ type model struct {
 	dashSelected    int
 	dashLayoutMode  int // 0=use dashboard layout; 1=tiled; 2=even-horizontal; 3=even-vertical; 4=main-vertical; 5=main-horizontal
 
-	// --- Minimal recorder (first-pass) ---
-	// Records commands that tmux-ssh-manager itself sends into panes via sendOnConnectToPaneLogged.
-	// This does NOT attempt to intercept keystrokes inside SSH.
 	recording            bool
 	recordingName        string
 	recordingDescription string
 	recordedPanes        map[string]*RecordedPane // key: pane_id ("%0"), value holds Host + Commands
 
-	// Pane-to-host mapping for panes created/managed by tmux-ssh-manager.
-	// This enables :send/:sendall and :dash save (snapshot) to associate panes with hosts.
 	paneHost map[string]string // key: pane_id ("%0") -> hostKey (Host.Name)
 
 	// Host Settings overlay (SecureCRT-like "session properties")

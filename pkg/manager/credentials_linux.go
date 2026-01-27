@@ -14,28 +14,10 @@ import (
 	"strings"
 )
 
-// Linux credential store implementation.
-//
-// Strategy:
-// - Prefer Secret Service via `secret-tool` when available (desktop-ish environments).
-// - If Secret Service is unavailable (common on headless servers), auto-fallback to a GPG-backed
-//   encrypted file store *if configured* (recipient or symmetric).
-//
-// Configuration (Linux):
-// - Secret Service: install `libsecret-tools` (provides `secret-tool`) AND ensure a provider is running.
-// - GPG fallback (headless-friendly):
-//     - Recipient mode: set TMUX_SSH_MANAGER_GPG_RECIPIENT=<keyid/email>
-//     - Symmetric mode (headless-safe loopback, FILE ONLY):
-//         - set TMUX_SSH_MANAGER_GPG_SYMMETRIC=1
-//         - set TMUX_SSH_MANAGER_GPG_PASSPHRASE_FILE=/path/to/file  (chmod 600)
-//       This avoids gpg-agent/pinentry prompts which can fail inside tmux popups/headless sessions.
-//   Optional (both modes): TMUX_SSH_MANAGER_GPG_BINARY=/path/to/gpg
-//
-// Security model notes (parity with darwin implementation):
-// - We never print secrets to stdout.
-// - CredGet verifies presence/access but does not reveal secret material.
-// - CredSet prompts on the controlling TTY (/dev/tty) without echo.
-// - CredReveal returns secret material for controlled integrations (e.g. SSH_ASKPASS). Callers MUST NOT log it.
+// Linux credential backend: Secret Service via `secret-tool`, with optional GPG file-store fallback.
+// Config (GPG): TMUX_SSH_MANAGER_GPG_RECIPIENT or TMUX_SSH_MANAGER_GPG_SYMMETRIC=1 + TMUX_SSH_MANAGER_GPG_PASSPHRASE_FILE (chmod 600).
+// Optional: TMUX_SSH_MANAGER_GPG_BINARY.
+// Security: do not print secrets; do not log CredReveal output.
 
 const secretServiceApp = "tmux-ssh-manager"
 
@@ -46,12 +28,7 @@ const (
 	envGPGPassphraseFile = "TMUX_SSH_MANAGER_GPG_PASSPHRASE_FILE"
 )
 
-// CredSet stores/updates a secret in the platform credential store.
-//
-// Linux behavior:
-// - Try Secret Service via secret-tool.
-// - If Secret Service is unavailable, fall back to GPG file store IF configured.
-// - Otherwise return a descriptive error.
+// CredSet stores/updates a secret.
 func CredSet(hostKey, username, kind string) error {
 	hostKey = strings.TrimSpace(hostKey)
 	username = strings.TrimSpace(username)

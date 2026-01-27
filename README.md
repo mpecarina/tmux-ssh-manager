@@ -1,5 +1,57 @@
 # tmux-ssh-manager
 
+## Interop: dashboards → tmux-session-manager `.tmux-session.yaml`
+
+tmux-ssh-manager can export a resolved dashboard into a tmux-session-manager spec file and (optionally) apply it via `tmux-session-manager --spec`.
+
+### What this is for
+- Turn a dashboard (multi-pane SSH view) into a portable, reproducible session spec (`.tmux-session.yaml` / `.json`).
+- Hand off “session materialization” to tmux-session-manager while keeping tmux-ssh-manager as the source of dashboard intent (hosts + commands).
+
+### How it works
+When enabled, tmux-ssh-manager:
+1) Resolves the dashboard (hosts + effective command lists per pane).
+2) Writes a spec file under your tmux-ssh-manager config directory (by default).
+3) Optionally opens a new tmux window and runs:
+   `tmux-session-manager --spec "<exported spec path>"`
+
+### Enable (environment variables)
+Set these (in the environment used to launch tmux-ssh-manager):
+
+- Enable integration:
+  - `TMUX_SSH_MANAGER_USE_SESSION_MANAGER=1`
+
+- Output format (optional; default: yaml):
+  - `TMUX_SSH_MANAGER_DASH_SPEC_FORMAT=yaml|json`
+
+- Output directory (optional; default: `~/.config/tmux-ssh-manager/dashboards`):
+  - `TMUX_SSH_MANAGER_DASH_SPEC_DIR=/path`
+
+- Deterministic splits (optional; default: on):
+  - `TMUX_SSH_MANAGER_DASH_DETERMINISTIC_SPLITS=0` to disable `pane_plan`
+
+- Apply after export (optional; default: on):
+  - `TMUX_SSH_MANAGER_DASH_APPLY=0` to export only (do not invoke tmux-session-manager)
+
+- tmux-session-manager binary path (optional; default: `tmux-session-manager`):
+  - `TMUX_SESSION_MANAGER_BIN=/path/to/tmux-session-manager`
+
+### Output
+The exported spec is written as:
+- `~/.config/tmux-ssh-manager/dashboards/<dashboard>.tmux-session.yaml` (or `.json`)
+
+The exported spec:
+- uses a single window (default name: `dashboard`)
+- uses `pane_plan` when deterministic splits are enabled
+- encodes each pane as “connect + send commands” using safe actions (no shell/tmux passthrough is intended by default)
+
+### Launching tmux-session-manager manually
+You can apply an exported dashboard spec directly:
+
+```sh
+tmux-session-manager --spec ~/.config/tmux-ssh-manager/dashboards/<dashboard>.tmux-session.yaml
+```
+
 ## Linux: credential storage (Secret Service + headless fallback)
 
 On macOS, `tmux-ssh-manager` can store credentials in Keychain.

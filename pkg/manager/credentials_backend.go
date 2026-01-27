@@ -6,32 +6,17 @@ import (
 	"strings"
 )
 
-// CredentialBackendKind describes which credential storage backend is active on the current OS.
-// This is intended for UI/help/status messages (not for security decisions).
+// CredentialBackendKind identifies the active credential backend (for UI/status only).
 type CredentialBackendKind string
 
 const (
-	// CredBackendKeychain is macOS Keychain (via `security`).
-	CredBackendKeychain CredentialBackendKind = "keychain"
-
-	// CredBackendSecretService is Linux Secret Service / libsecret (via `secret-tool`).
+	CredBackendKeychain      CredentialBackendKind = "keychain"
 	CredBackendSecretService CredentialBackendKind = "secret-service"
-
-	// CredBackendGPGFileStore is a headless-friendly encrypted file store using `gpg`.
-	// This is intended as a fallback when Secret Service is unavailable on Linux.
-	CredBackendGPGFileStore CredentialBackendKind = "gpg"
-
-	// CredBackendUnsupported means the project has no credential backend implementation
-	// for this OS/target.
-	CredBackendUnsupported CredentialBackendKind = "unsupported"
+	CredBackendGPGFileStore  CredentialBackendKind = "gpg"
+	CredBackendUnsupported   CredentialBackendKind = "unsupported"
 )
 
-// linuxGPGConfigured reports whether the Linux GPG fallback is configured.
-// This is intentionally environment-driven so headless systems can opt into a reliable backend.
-//
-// Supported configuration (any of the following enables it):
-// - TMUX_SSH_MANAGER_GPG_RECIPIENT=<keyid/email>
-// - TMUX_SSH_MANAGER_GPG_SYMMETRIC=1
+// linuxGPGConfigured reports whether the GPG backend is enabled via env.
 func linuxGPGConfigured() bool {
 	if strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_GPG_RECIPIENT")) != "" {
 		return true
@@ -44,13 +29,7 @@ func linuxGPGConfigured() bool {
 	}
 }
 
-// CredentialBackend returns the effective backend kind for the current runtime OS.
-//
-// Note:
-//   - This is used only for messaging. Actual support is enforced by OS-specific implementations
-//     of CredSet/CredGet/CredReveal/CredDelete.
-//   - On Linux, this attempts to reflect the configured fallback behavior: if GPG fallback is
-//     configured, we label it as such (since Secret Service may not exist on headless systems).
+// CredentialBackend returns the backend kind for the current OS/runtime.
 func CredentialBackend() CredentialBackendKind {
 	switch runtime.GOOS {
 	case "darwin":
@@ -65,12 +44,7 @@ func CredentialBackend() CredentialBackendKind {
 	}
 }
 
-// CredentialBackendLabel returns a user-facing short label for the active backend.
-//
-// Examples:
-// - "Keychain" (macOS)
-// - "Secret Service (secret-tool)" (Linux desktop)
-// - "GPG (encrypted file store)" (Linux headless fallback)
+// CredentialBackendLabel returns a short label for display.
 func CredentialBackendLabel() string {
 	switch CredentialBackend() {
 	case CredBackendKeychain:

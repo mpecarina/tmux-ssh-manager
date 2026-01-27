@@ -31,109 +31,59 @@ var (
 	flagPrintConfig  bool
 	flagDryRun       bool
 
-	// New: control TUI source and SSH config paths
 	flagTUISource string // "yaml" (default) or "ssh"
 	flagSSHConfig string // comma-separated paths; defaults to ~/.ssh/config when empty
 
-	// New: direct-connect tmux fanout (single host)
 	flagSplitCount  int
 	flagSplitLayout string
 	flagSplitMode   string
-
-	// Hidden flag: use classic TUI engine (line-oriented) instead of Bubble Tea
-	flagTUIClassic bool
 )
 
 func init() {
-	flag.StringVar(&flagConfig, "config", "", "Path to YAML config (defaults to standard XDG paths if empty)")
-	flag.StringVar(&flagHost, "host", "", "Connect directly to a configured host by name (bypass selector). If not found in config, treated as literal destination (e.g., user@host)")
-	flag.BoolVar(&flagExecReplace, "exec-replace", false, "Replace the current process with ssh (true) or run ssh as a child and return (false)")
-	flag.BoolVar(&flagList, "list", false, "List hosts and exit (respects --tui-source)")
-	flag.StringVar(&flagInitialQuery, "query", "", "Initial query for the TUI selector")
-	flag.IntVar(&flagMaxResults, "max", 20, "Maximum results to display in the TUI")
-	flag.BoolVar(&flagPrintConfig, "print-config-path", false, "Print the resolved config path(s) and exit")
-	flag.BoolVar(&flagDryRun, "dry-run", false, "Print the ssh command that would be executed and exit")
+	flag.StringVar(&flagConfig, "config", "", "Path to YAML config (defaults to XDG paths if empty)")
+	flag.StringVar(&flagHost, "host", "", "Connect directly to a host (config name or literal destination like user@host)")
+	flag.BoolVar(&flagExecReplace, "exec-replace", false, "Replace this process with ssh")
+	flag.BoolVar(&flagList, "list", false, "List hosts and exit")
+	flag.StringVar(&flagInitialQuery, "query", "", "Initial query for the TUI")
+	flag.IntVar(&flagMaxResults, "max", 20, "Max results in the TUI")
+	flag.BoolVar(&flagPrintConfig, "print-config-path", false, "Print resolved config path(s) and exit")
+	flag.BoolVar(&flagDryRun, "dry-run", false, "Print the ssh command and exit")
 
-	// New: direct-connect tmux fanout (single host)
-	// Usage: --host <name> --split-count N [--split-mode v|h|window] [--split-layout tiled|even-horizontal|even-vertical|main-horizontal|main-vertical|<raw tmux layout>]
-	flag.IntVar(&flagSplitCount, "split-count", 0, "When used with --host inside tmux, open N total connections to the same host (1 = single connect; >1 creates additional panes/windows)")
-	flag.StringVar(&flagSplitMode, "split-mode", "window", "When used with --split-count>0: 'window' (default) opens each connection in a new tmux window; 'v' uses vertical splits; 'h' uses horizontal splits")
-	flag.StringVar(&flagSplitLayout, "split-layout", "", "When used with --split-count>1 and split mode is 'v' or 'h', apply tmux select-layout with this value (e.g. tiled, even-horizontal, even-vertical, main-horizontal, main-vertical, or a raw tmux layout string)")
+	flag.IntVar(&flagSplitCount, "split-count", 0, "With --host inside tmux: open N connections (1=single; >1 creates panes/windows)")
+	flag.StringVar(&flagSplitMode, "split-mode", "window", "With --split-count>0: window|v|h")
+	flag.StringVar(&flagSplitLayout, "split-layout", "", "With --split-count>1 and split-mode v/h: tmux layout name or raw layout string")
 
-	// New flags for SSH-config-backed TUI
-	flag.StringVar(&flagTUISource, "tui-source", "yaml", "Source for TUI/list: 'yaml' (default) or 'ssh'")
-	flag.StringVar(&flagSSHConfig, "ssh-config", "", "SSH config file path(s), comma-separated; defaults to ~/.ssh/config")
-
-	// Hidden/internal flag for classic TUI fallback
-	flag.BoolVar(&flagTUIClassic, "classic-tui", false, "(internal) use classic TUI engine")
+	flag.StringVar(&flagTUISource, "tui-source", "yaml", "TUI source: yaml|ssh")
+	flag.StringVar(&flagSSHConfig, "ssh-config", "", "SSH config path(s), comma-separated (default: ~/.ssh/config)")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "tmux-ssh-manager - tmux-friendly SSH session manager\n\n")
+		fmt.Fprintf(os.Stderr, "tmux-ssh-manager\n\n")
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  tmux-ssh-manager [options]\n")
+		fmt.Fprintf(os.Stderr, "  tmux-ssh-manager --host <name-or-destination> [-- <extra ssh args...>]\n")
 		fmt.Fprintf(os.Stderr, "  tmux-ssh-manager cred <set|get|delete> --host <alias>\n")
 		fmt.Fprintf(os.Stderr, "  tmux-ssh-manager ssh <ssh-style args...>\n")
-		fmt.Fprintf(os.Stderr, "  tmux-ssh-manager scp <scp-style args...>\n")
-		fmt.Fprintf(os.Stderr, "  tmux-ssh-manager --host <name-or-destination> [-- <extra ssh args...>]\n\n")
+		fmt.Fprintf(os.Stderr, "  tmux-ssh-manager scp <scp-style args...>\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, `
 Examples:
-  # Run the TUI selector from YAML (default)
   tmux-ssh-manager
-
-  # Run the TUI from YAML with a specific config and initial query
-  tmux-ssh-manager --config ~/.config/tmux-ssh-manager/hosts.yaml --query "dc1 rtr"
-
-  # Run the TUI over native SSH config aliases
   tmux-ssh-manager --tui-source ssh
-  # or with explicit config files (comma-separated)
   tmux-ssh-manager --tui-source ssh --ssh-config ~/.ssh/config,~/.ssh/config.d/*.conf
-
-  # ssh-like wrapper entrypoint (good for aliasing)
-  tmux-ssh-manager ssh hostname
-  tmux-ssh-manager ssh hostname -p 922
-
-  # scp-like wrapper entrypoint (good for aliasing)
-  tmux-ssh-manager scp file.txt hostname:/tmp/
-  tmux-ssh-manager scp hostname:/var/log/syslog .
-
-  # Connect directly to a configured YAML host name, replacing the process with ssh
-  tmux-ssh-manager --host rtr1.dc1.example.com --exec-replace
-
-  # Connect to a literal destination or SSH alias (treated as ssh <arg>)
-  tmux-ssh-manager --host netops@leaf01.lab.local -- -p 2222 -o StrictHostKeyChecking=no
-
-  # Manage credentials in macOS Keychain (no auto-inject required)
+  tmux-ssh-manager --host user@host -- -p 2222
   tmux-ssh-manager cred set --host leaf01.lab.local
-  tmux-ssh-manager cred get --host leaf01.lab.local
-  tmux-ssh-manager cred delete --host leaf01.lab.local
-
-Notes:
-  - The "--" token in these examples is a tmux-ssh-manager CLI separator. It is NOT forwarded to ssh.
-    Extra arguments after "--" are forwarded to ssh as normal ssh arguments.
-    (macOS/OpenSSH does not support using a literal "--" as an "end of options" marker.)
-  - When connecting to a literal host (via "--host user@dest"), extra args after "--" are placed before the destination.
-    When connecting via configured hosts, extra args are appended after the destination (ssh DEST <args...>).
-  - Credential commands are macOS-only in intent; storage is delegated to a backend in pkg/manager.
-  - Password auto-inject (if enabled in the future) must be treated as a security-sensitive feature.
 `)
 	}
 }
 
 func main() {
-	// Allow passthrough ssh args via '--'
 	flag.Parse()
 	sshArgs := flag.Args()
 
-	// Subcommands: internal helpers + credential management (macOS Keychain-backed via pkg/manager) + ssh/scp wrappers.
-	// These run before the normal config-loading path below.
 	if flag.NArg() >= 1 {
 		switch flag.Arg(0) {
 		case "__askpass":
-			// Hidden/internal: used only as SSH_ASKPASS helper.
-			// It retrieves the credential from Keychain and prints it to stdout so ssh can consume it.
-			// Do not use this directly; it is security-sensitive by design.
 			if err := runAskpassSubcommand(flag.Args()[1:]); err != nil {
 				fmt.Fprintf(os.Stderr, "tmux-ssh-manager: %v\n", err)
 				os.Exit(exitCodeFromErr(err))
@@ -141,7 +91,6 @@ func main() {
 			return
 
 		case "__connect":
-			// Hidden/internal: expect-like connector. Used by tmux split/window launches when login automation is enabled.
 			if err := runConnectSubcommand(flag.Args()[1:]); err != nil {
 				fmt.Fprintf(os.Stderr, "tmux-ssh-manager: %v\n", err)
 				os.Exit(exitCodeFromErr(err))
@@ -149,8 +98,6 @@ func main() {
 			return
 
 		case "__hostextras-switch-to-identity":
-			// Hidden/internal: used by key-install workflows to switch a host from keychain/askpass to identity-based auth
-			// after authorized_keys was successfully updated.
 			if err := runHostExtrasSwitchToIdentitySubcommand(flag.Args()[1:]); err != nil {
 				fmt.Fprintf(os.Stderr, "tmux-ssh-manager: %v\n", err)
 				os.Exit(exitCodeFromErr(err))
@@ -158,7 +105,6 @@ func main() {
 			return
 
 		case "cred":
-			// Public credential management.
 			if err := runCredSubcommand(flag.Args()[1:]); err != nil {
 				fmt.Fprintf(os.Stderr, "tmux-ssh-manager: %v\n", err)
 				os.Exit(exitCodeFromErr(err))
@@ -166,14 +112,8 @@ func main() {
 			return
 
 		case "ssh":
-			// Public ssh-like wrapper.
-			//
-			// IMPORTANT:
-			// Like the "scp" subcommand, this runs before the normal config-loading path in main().
-			// So we load config here on-demand (best-effort); if it fails we still support passthrough ssh.
 			var cfg *manager.Config
 			if strings.EqualFold(flagTUISource, "ssh") {
-				// Best-effort: build Config from SSH config aliases
 				var sshPaths []string
 				if strings.TrimSpace(flagSSHConfig) != "" {
 					for _, p := range strings.Split(flagSSHConfig, ",") {
@@ -187,17 +127,11 @@ func main() {
 					cfg = conf
 				}
 			} else {
-				// Best-effort: load YAML config
 				if conf, _, err := manager.LoadConfig(flagConfig); err == nil {
 					cfg = conf
 				}
 			}
 
-			// Behavior:
-			// - Parses ssh-style args enough to identify destination host/user and port.
-			// - If a matching host exists in config and login_mode=askpass with a stored credential is available,
-			//   it will use the PTY connector (internal __connect) so password prompts can be satisfied.
-			// - Otherwise, it execs the system ssh with the original args.
 			if err := runSSHWrapperSubcommand(cfg, flag.Args()[1:], flagExecReplace); err != nil {
 				fmt.Fprintf(os.Stderr, "tmux-ssh-manager: %v\n", err)
 				os.Exit(exitCodeFromErr(err))
@@ -205,22 +139,8 @@ func main() {
 			return
 
 		case "scp":
-			// Public scp-like wrapper.
-			//
-			// Behavior:
-			// - Parses scp-style args enough to identify the "remote host token" (user@host:... or host:...).
-			// - If HostExtras auth_mode=keychain (or YAML login_mode=askpass when host exists in config) and a credential
-			//   is available, run scp with SSH_ASKPASS pointing at our internal __askpass helper.
-			// - Otherwise, exec system scp with identical args.
-			//
-			// Note: unlike ssh, scp is non-interactive, so we do NOT use __connect (PTY expect).
-
-			// IMPORTANT:
-			// Like the "ssh" subcommand, this runs before the normal config-loading path in main().
-			// So we load config here on-demand (best-effort); if it fails we still support passthrough scp.
 			var cfg *manager.Config
 			if strings.EqualFold(flagTUISource, "ssh") {
-				// Best-effort: build Config from SSH config aliases
 				var sshPaths []string
 				if strings.TrimSpace(flagSSHConfig) != "" {
 					for _, p := range strings.Split(flagSSHConfig, ",") {
@@ -234,7 +154,6 @@ func main() {
 					cfg = conf
 				}
 			} else {
-				// Best-effort: load YAML config
 				if conf, _, err := manager.LoadConfig(flagConfig); err == nil {
 					cfg = conf
 				}
@@ -369,16 +288,9 @@ func main() {
 		ExecReplace:  flagExecReplace,
 		MaxResults:   flagMaxResults,
 	}
-	if flagTUIClassic || strings.EqualFold(os.Getenv("TMUX_SSH_MANAGER_TUI"), "classic") {
-		if err := manager.RunTUIClassic(cfg, opts); err != nil {
-			fmt.Fprintf(os.Stderr, "tmux-ssh-manager: %v\n", err)
-			os.Exit(exitCodeFromErr(err))
-		}
-	} else {
-		if err := manager.RunTUI(cfg, opts); err != nil {
-			fmt.Fprintf(os.Stderr, "tmux-ssh-manager: %v\n", err)
-			os.Exit(exitCodeFromErr(err))
-		}
+	if err := manager.RunTUI(cfg, opts); err != nil {
+		fmt.Fprintf(os.Stderr, "tmux-ssh-manager: %v\n", err)
+		os.Exit(exitCodeFromErr(err))
 	}
 }
 
