@@ -350,6 +350,35 @@ func (s *State) ensureUnique() {
 				continue
 			}
 			seen[name] = struct{}{}
+
+			// Normalize register names to keep UI selection and dedupe stable.
+			if len(d.Registers) > 0 {
+				rseen := map[string]struct{}{}
+				rout := d.Registers[:0]
+				for _, r := range d.Registers {
+					r.Name = strings.TrimSpace(r.Name)
+					if r.Name == "" {
+						continue
+					}
+					if _, ok := rseen[r.Name]; ok {
+						continue
+					}
+					rseen[r.Name] = struct{}{}
+					r.Description = strings.TrimSpace(r.Description)
+
+					cmds := r.Commands[:0]
+					for _, c := range r.Commands {
+						c = strings.TrimSpace(c)
+						if c != "" {
+							cmds = append(cmds, c)
+						}
+					}
+					r.Commands = cmds
+					rout = append(rout, r)
+				}
+				d.Registers = rout
+			}
+
 			out = append(out, d)
 		}
 		s.RecordedDashboards = out
@@ -379,6 +408,18 @@ func equalStringSets(a, b []string) bool {
 
 // ----- Recording & Replay (Dashboards captured in state.json) -----
 
+// DashboardRegister is a named command list (vim-like) that can be attached to dashboards and replayed.
+// A register is a sequence of commands intended to be pasted into a remote shell and executed
+// by pressing Enter after each command (or by explicitly appending Enter in the sender).
+type DashboardRegister struct {
+	// Name is the register identifier (e.g. "a", "b", "noc", "health").
+	Name string `json:"name"`
+	// Description is optional metadata for UI display.
+	Description string `json:"description,omitempty"`
+	// Commands is the ordered list of commands in this register.
+	Commands []string `json:"commands,omitempty"`
+}
+
 // RecordedDashboard is a persisted, ad-hoc dashboard captured from a live session.
 type RecordedDashboard struct {
 	// Name is the unique identifier for the recorded dashboard.
@@ -395,6 +436,10 @@ type RecordedDashboard struct {
 
 	// Panes holds the recorded pane definitions (title/host/commands).
 	Panes []RecordedPane `json:"panes"`
+
+	// Registers holds named command lists associated with this dashboard.
+	// These are intended to be selectable in the UI as quick paste actions.
+	Registers []DashboardRegister `json:"registers,omitempty"`
 }
 
 // RecordedPane captures a single pane's target and the commands that were executed.
@@ -423,7 +468,7 @@ func (s *State) UpsertRecordedDashboard(rd RecordedDashboard) bool {
 	}
 	rd.Updated = now
 
-	// sanitize commands
+	// sanitize pane commands
 	for i := range rd.Panes {
 		rd.Panes[i].Title = strings.TrimSpace(rd.Panes[i].Title)
 		rd.Panes[i].Host = strings.TrimSpace(rd.Panes[i].Host)
@@ -435,6 +480,34 @@ func (s *State) UpsertRecordedDashboard(rd RecordedDashboard) bool {
 			}
 		}
 		rd.Panes[i].Commands = cmds
+	}
+
+	// sanitize registers
+	if len(rd.Registers) > 0 {
+		out := rd.Registers[:0]
+		seen := map[string]struct{}{}
+		for _, r := range rd.Registers {
+			r.Name = strings.TrimSpace(r.Name)
+			if r.Name == "" {
+				continue
+			}
+			if _, ok := seen[r.Name]; ok {
+				continue
+			}
+			seen[r.Name] = struct{}{}
+			r.Description = strings.TrimSpace(r.Description)
+
+			cmds := r.Commands[:0]
+			for _, c := range r.Commands {
+				c = strings.TrimSpace(c)
+				if c != "" {
+					cmds = append(cmds, c)
+				}
+			}
+			r.Commands = cmds
+			out = append(out, r)
+		}
+		rd.Registers = out
 	}
 
 	// update if exists

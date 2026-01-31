@@ -62,6 +62,11 @@ func buildCandidates(cfg *Config) []candidate {
 }
 
 // rankMatches filters and sorts candidates by fuzzy score against query.
+//
+// Query semantics (simple, fzf-like tokenization):
+// - Split query on whitespace into tokens.
+// - All tokens must match (AND).
+// - Score is the sum of token scores (higher is better).
 func rankMatches(cands []candidate, query string) []candidate {
 	q := strings.TrimSpace(query)
 	if q == "" {
@@ -74,15 +79,42 @@ func rankMatches(cands []candidate, query string) []candidate {
 		return out
 	}
 
+	// Tokenize on whitespace, ignore empty tokens.
+	// Note: This intentionally keeps the syntax simple (no quoting, no OR).
+	tokens := strings.Fields(q)
+	if len(tokens) == 0 {
+		out := make([]candidate, len(cands))
+		copy(out, cands)
+		sort.SliceStable(out, func(i, j int) bool {
+			return out[i].Host.Name < out[j].Host.Name
+		})
+		return out
+	}
+
 	type scored struct {
 		c candidate
 		s int
 	}
-	lowQ := strings.ToLower(q)
+
+	// Lowercase tokens for case-insensitive matching (SearchText is already lowercase).
+	for i := range tokens {
+		tokens[i] = strings.ToLower(tokens[i])
+	}
+
 	scoreds := make([]scored, 0, len(cands))
 	for _, c := range cands {
-		if s, ok := fuzzyScore(lowQ, c.SearchText); ok {
-			scoreds = append(scoreds, scored{c: c, s: s})
+		total := 0
+		okAll := true
+		for _, t := range tokens {
+			if s, ok := fuzzyScore(t, c.SearchText); ok {
+				total += s
+			} else {
+				okAll = false
+				break
+			}
+		}
+		if okAll {
+			scoreds = append(scoreds, scored{c: c, s: total})
 		}
 	}
 

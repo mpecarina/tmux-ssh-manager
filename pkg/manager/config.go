@@ -53,6 +53,9 @@ type Group struct {
 	OnConnect   []string `yaml:"on_connect,omitempty"`
 	PreConnect  []string `yaml:"pre_connect,omitempty"`
 	PostConnect []string `yaml:"post_connect,omitempty"`
+
+	// Registers are named command lists available to hosts in this group (host-level overrides/extends).
+	Registers []Register `yaml:"registers,omitempty"`
 }
 
 // Macro is a named list of commands that can be sent after connecting.
@@ -106,6 +109,9 @@ type Host struct {
 	OnConnect   []string `yaml:"on_connect,omitempty"`
 	PreConnect  []string `yaml:"pre_connect,omitempty"`
 	PostConnect []string `yaml:"post_connect,omitempty"`
+
+	// Registers are named command lists available when this host is the active pane/target.
+	Registers []Register `yaml:"registers,omitempty"`
 }
 
 // ResolvedHost captures the effective settings after merging group defaults with host overrides.
@@ -123,6 +129,18 @@ type ResolvedHost struct {
 	// before sending on_connect commands.
 	// Resolution: host.connect_delay_ms overrides group.connect_delay_ms (if set).
 	EffectiveConnectDelayMS int
+}
+
+// Register is a named sequence of commands for quick paste into remote terminals.
+type Register struct {
+	// Name is the identifier (e.g. "a", "ops", "warmup"). Must be unique.
+	Name string `yaml:"name"`
+
+	// Description is optional UI text.
+	Description string `yaml:"description,omitempty"`
+
+	// Commands are sent in order; each requires an extra Enter by the operator to execute on the remote host.
+	Commands []string `yaml:"commands"`
 }
 
 // ErrConfigNotFound is returned when no configuration file can be located.

@@ -1,5 +1,49 @@
 # tmux-ssh-manager
 
+## Registers (host-scoped, vim-like)
+
+Registers are named command lists you can paste into the active host’s pane without automatically pressing Enter. Registers are **resolved per host** (so different hosts can have different registers).
+
+### Usage (host-scoped)
+- Open registers for the active host pane:
+  - `Ctrl-r`
+  - or command bar: `:r` / `:registers`
+- Navigate: `j/k`
+- Paste selection (does not press Enter): `Enter`
+- Close: `Esc` / `q`
+
+### YAML config (host-scoped)
+
+Define registers on a host (or group) so they are **not global**:
+
+```yaml
+hosts:
+  - name: rtr1
+    registers:
+      - name: health
+        description: "Quick checks"
+        commands:
+          - terminal length 0
+          - show version
+          - show clock
+```
+
+Optionally attach register names to a dashboard for discoverability.
+
+Notes:
+- Dashboard `registers` are still **host-scoped**.
+- A register name listed on a dashboard must exist on the target pane host (from either the host’s `registers` or its group’s `registers`).
+
+```yaml
+dashboards:
+  - name: core-status
+    registers: [health]
+    panes:
+      - host: rtr1
+        commands:
+          - show ip interface brief
+```
+
 ## Interop: dashboards → tmux-session-manager `.tmux-session.yaml`
 
 tmux-ssh-manager can export a resolved dashboard into a tmux-session-manager spec file and (optionally) apply it via `tmux-session-manager --spec`.
@@ -1039,9 +1083,15 @@ set -g @tmux_ssh_manager_bin '~/.tmux/plugins/tmux-ssh-manager/bin/tmux-ssh-mana
 bind-key s run-shell "~/.tmux/plugins/tmux-ssh-manager/scripts/tmux_ssh_manager.tmux"
 
 # Optional: choose how the UI launches
-# - window (default): opens a new tmux window running the TUI (recommended)
+# - window (default): opens a new tmux window running the UI (recommended)
 # - popup: opens in a tmux popup (tmux >= 3.2)
 set -g @tmux_ssh_manager_launch_mode 'window'
+
+# Optional: choose how host selection works (picker)
+# - tui (default): built-in interactive UI
+# - fzf: use fzf for multi-select (Space toggles selection in fzf; spaces in the query are allowed)
+#   Requires `fzf` to be installed and on PATH for the tmux server environment.
+set -g @tmux_ssh_manager_picker 'tui'
 
 # TPM init (keep at bottom)
 run '~/.tmux/plugins/tpm/tpm'

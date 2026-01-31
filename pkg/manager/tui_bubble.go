@@ -87,6 +87,17 @@ type model struct {
 	dashSelected    int
 	dashLayoutMode  int // 0=use dashboard layout; 1=tiled; 2=even-horizontal; 3=even-vertical; 4=main-vertical; 5=main-horizontal
 
+	// Registers modal (device-scoped): list only registers for the active host and paste into its pane without Enter.
+	showRegisters bool
+	regSelected   int
+	regScroll     int
+	regTargetPane string
+	regTargetHost string
+	regStatus     string
+
+	// Cached register list for the current target host (built when opening the modal).
+	regItems []Register
+
 	recording            bool
 	recordingName        string
 	recordingDescription string
@@ -505,6 +516,13 @@ func (m *model) buildCmdCandidates() []string {
 		// Send commands (records cleanly + works for NOC dashboards).
 		"send ",
 		"sendall ",
+
+		"r",
+		"r ",
+		"reg",
+		"reg ",
+		"registers",
+		"registers ",
 
 		// Watch helpers (sugar over :send/:sendall).
 		// Usage:
@@ -1155,7 +1173,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						fileLines = parts
 					} else if os.IsNotExist(rerr) {
 						fileLines = []string{}
-					} else if rerr != nil {
+					} else {
 						m.setStatus(fmt.Sprintf("ssh import: read %s failed: %v", targetPath, rerr), 4000)
 						return m, tea.ClearScreen
 					}
@@ -2740,6 +2758,77 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
+		// Registers modal: navigation + paste (no Enter)
+		if m.showRegisters {
+			switch msg.String() {
+			case "esc", "q":
+				m.showRegisters = false
+				m.pendingG = false
+				m.input.Blur()
+				m.recomputeFilter()
+				return m, tea.ClearScreen
+
+			case "j", "down":
+				n := len(m.regItems)
+				if n > 0 && m.regSelected+1 < n {
+					m.regSelected++
+				}
+				return m, nil
+
+			case "k", "up":
+				if m.regSelected > 0 {
+					m.regSelected--
+				}
+				return m, nil
+
+			case "enter":
+				if len(m.regItems) == 0 {
+					m.setStatus("registers: no registers for this host", 3000)
+					m.showRegisters = false
+					return m, tea.ClearScreen
+				}
+				if m.regSelected < 0 || m.regSelected >= len(m.regItems) {
+					m.setStatus("registers: no register selected", 3000)
+					m.showRegisters = false
+					return m, tea.ClearScreen
+				}
+				reg := m.regItems[m.regSelected]
+				if strings.TrimSpace(reg.Name) == "" || len(reg.Commands) == 0 {
+					m.setStatus("registers: empty register", 3000)
+					m.showRegisters = false
+					return m, tea.ClearScreen
+				}
+
+				// Device-scoped: require an explicit host + pane target.
+				paneID := strings.TrimSpace(m.regTargetPane)
+				hostKey := strings.TrimSpace(m.regTargetHost)
+				if paneID == "" || hostKey == "" {
+					m.setStatus("registers: no target pane/host (open from a host context)", 3500)
+					m.showRegisters = false
+					return m, tea.ClearScreen
+				}
+
+				// Paste commands WITHOUT Enter (operator presses Enter manually).
+				sent := 0
+				for _, c := range reg.Commands {
+					c = strings.TrimSpace(c)
+					if c == "" {
+						continue
+					}
+					_, _ = AppendHostLogLine(hostKey, time.Now(), DefaultLogOptions(), ">>> "+c)
+					_ = exec.Command("tmux", "send-keys", "-t", paneID, "--", c).Run()
+					sent++
+				}
+
+				m.setStatus(fmt.Sprintf("register %q pasted (%d line(s))", reg.Name, sent), 2500)
+				m.showRegisters = false
+				return m, tea.ClearScreen
+
+			default:
+				return m, nil
+			}
+		}
+
 		// Help overlay: most keys exit help
 		if m.showHelp {
 			switch msg.String() {
@@ -2828,6 +2917,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							"Dashboards: B browser • :dash [name] • l layout override (in dashboards)\n"+
 							"Network: N view • :net • :network\n"+
 							"Commands: :send <cmd> • :sendall <cmd> • :watch [interval_s] <cmd> • :watchall [interval_s] <cmd>\n"+
+							"Registers: ctrl+r • :r • :registers (device-scoped; pastes without Enter)\n"+
 							"Save: Ctrl+s save current window as a recorded dashboard\n"+
 							"Recorder: :record start <name> [desc...] • :record stop • :record save [name] • :record delete <name> • :record status\n"+
 							"Host: S settings • :login manual|askpass|status • :cred status|set|delete\n"+
@@ -3034,6 +3124,60 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						sent++
 					}
 					m.setStatus(fmt.Sprintf("watch every %ds: sent + recorded to %d pane(s)", interval, sent), 2500)
+					return m, tea.ClearScreen
+
+				case "r", "reg", "registers":
+					// Device-scoped registers picker. Requires the active pane to be mapped to a host.
+					paneID := ""
+					if out, e := exec.Command("tmux", "display-message", "-p", "#{pane_id}").Output(); e == nil {
+						paneID = strings.TrimSpace(string(out))
+					}
+					if paneID == "" && len(m.createdPaneIDs) > 0 {
+						paneID = strings.TrimSpace(m.createdPaneIDs[len(m.createdPaneIDs)-1])
+					}
+					if paneID == "" {
+						m.setStatus("registers: could not resolve a tmux pane id", 3500)
+						return m, tea.ClearScreen
+					}
+
+					hostKey := ""
+					if m.paneHost != nil {
+						hostKey = strings.TrimSpace(m.paneHost[paneID])
+					}
+					if hostKey == "" {
+						m.setStatus("registers: no host mapped to this pane", 3500)
+						return m, tea.ClearScreen
+					}
+
+					// Build host-scoped register list from resolved host/group registers.
+					items := make([]Register, 0, 8)
+					if m.cfg != nil {
+						if hh := m.cfg.HostByName(hostKey); hh != nil {
+							rh := m.cfg.ResolveEffective(*hh)
+							if rh.Group != nil && len(rh.Group.Registers) > 0 {
+								items = append(items, rh.Group.Registers...)
+							}
+							if len(rh.Host.Registers) > 0 {
+								items = append(items, rh.Host.Registers...)
+							}
+						}
+					}
+					if len(items) == 0 {
+						m.setStatus("registers: no registers for this host", 3000)
+						return m, tea.ClearScreen
+					}
+
+					m.pendingG = false
+					m.input.Blur()
+					m.showHelp = false
+					m.showCmdline = false
+					m.showRegisters = true
+					m.regItems = items
+					m.regSelected = 0
+					m.regScroll = 0
+					m.regTargetPane = paneID
+					m.regTargetHost = hostKey
+					m.regStatus = ""
 					return m, tea.ClearScreen
 
 				case "send":
@@ -4278,6 +4422,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// - treat nearly all keys as literal text (so j/k/n/q/s/v/etc. are not stolen)
 		// - allow arrow keys to navigate the selection without leaving insert-mode
 		// - only allow explicit mode switches or confirmations
+		//
+		// UX tweak:
+		// - Space is a common multi-select toggle. When search is focused, we assume the
+		//   user wants to select the highlighted row (not insert a leading space into the query).
+		// - Therefore: Space exits insert-mode (blurs search) and toggles selection.
 		if m.input.Focused() {
 			switch msg.String() {
 			case "up":
@@ -4286,6 +4435,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "down":
 				m.move(1)
 				return m, nil
+
+			case " ":
+				// Space in search-focused mode:
+				// - If query is empty: treat as a selection toggle (exit insert-mode to avoid leading-space queries)
+				// - Otherwise: allow spaces in the query (fzf-style multi-term searching)
+				if strings.TrimSpace(m.input.Value()) == "" {
+					m.input.Blur()
+					m.recomputeFilter()
+					if sel := m.current(); sel != nil {
+						if _, ok := m.selectedSet[m.selected]; ok {
+							delete(m.selectedSet, m.selected)
+						} else {
+							m.selectedSet[m.selected] = struct{}{}
+						}
+						m.setStatus(fmt.Sprintf("Selected: %d", m.selectedCount()), 1200)
+					}
+					return m, nil
+				}
+
+				// Non-empty query: insert a literal space and keep filtering.
+				var cmd tea.Cmd
+				m.input, cmd = m.input.Update(msg)
+				m.recomputeFilter()
+				return m, cmd
 
 			case "enter":
 				// Confirm current selection while staying in the main flow.
@@ -5048,6 +5221,63 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.dashSelected = 0
 			}
 			return m, nil
+		case "ctrl+r":
+			// Registers: device-scoped paste (no Enter). Requires a known host for the active pane.
+			if m.showHelp || m.showLogs || m.showDashBrowser || m.showCmdline || m.showHostSettings || m.showAddSSHHost || m.showMergeDupsConfirm || m.showRouterIDEditor || m.showMgmtIPEditor || m.showDeviceOSEditor || m.showNetworkView || m.showSSHConfigXfer || m.showSSHPathPrompt || m.showSSHPostWriteConfirm {
+				return m, nil
+			}
+
+			paneID := ""
+			if out, e := exec.Command("tmux", "display-message", "-p", "#{pane_id}").Output(); e == nil {
+				paneID = strings.TrimSpace(string(out))
+			}
+			if paneID == "" && len(m.createdPaneIDs) > 0 {
+				paneID = strings.TrimSpace(m.createdPaneIDs[len(m.createdPaneIDs)-1])
+			}
+			if paneID == "" {
+				m.setStatus("registers: could not resolve a tmux pane id", 3500)
+				return m, nil
+			}
+
+			hostKey := ""
+			if m.paneHost != nil {
+				hostKey = strings.TrimSpace(m.paneHost[paneID])
+			}
+			if hostKey == "" {
+				m.setStatus("registers: no host mapped to this pane", 3500)
+				return m, nil
+			}
+
+			// Build host-scoped registers list from resolved host/group registers.
+			items := make([]Register, 0, 8)
+			if m.cfg != nil {
+				if hh := m.cfg.HostByName(hostKey); hh != nil {
+					rh := m.cfg.ResolveEffective(*hh)
+					if rh.Group != nil && len(rh.Group.Registers) > 0 {
+						items = append(items, rh.Group.Registers...)
+					}
+					if len(rh.Host.Registers) > 0 {
+						items = append(items, rh.Host.Registers...)
+					}
+				}
+			}
+			if len(items) == 0 {
+				m.setStatus("registers: no registers for this host", 3000)
+				return m, nil
+			}
+
+			m.pendingG = false
+			m.input.Blur()
+			m.showHelp = false
+			m.showCmdline = false
+			m.showRegisters = true
+			m.regItems = items
+			m.regSelected = 0
+			m.regScroll = 0
+			m.regTargetPane = paneID
+			m.regTargetHost = hostKey
+			m.regStatus = ""
+			return m, tea.ClearScreen
 		}
 
 		// Treat other typed text as new search query (vim-ish)
@@ -5275,6 +5505,70 @@ func (m model) View() string {
 	headerLeft := "tmux-ssh-manager — Sessions"
 	b.WriteString(m.theme.HeaderLine(headerLeft) + "\n")
 	b.WriteString(m.theme.apply(m.theme.Separator, strings.Repeat("-", minInt(len(headerLeft), maxInt(3, m.width)))) + "\n")
+
+	// Registers modal (device-scoped)
+	if m.showRegisters {
+		b.WriteString(m.theme.HeaderLine("Registers") + "\n")
+		b.WriteString(m.theme.apply(m.theme.Separator, strings.Repeat("-", maxInt(6, minInt(m.width, 30)))) + "\n")
+		b.WriteString("\n")
+
+		if strings.TrimSpace(m.regTargetHost) != "" {
+			b.WriteString(m.theme.apply(m.theme.Dim, "host: "+strings.TrimSpace(m.regTargetHost)) + "\n\n")
+		}
+
+		n := len(m.regItems)
+		if n == 0 {
+			b.WriteString("No registers for this host.\n\n")
+			b.WriteString("Keys: Esc/q close\n")
+			return b.String()
+		}
+
+		sel := clampInt(m.regSelected, 0, n-1)
+		scroll := clampInt(m.regScroll, 0, n-1)
+
+		visible := 10
+		if m.height > 0 {
+			visible = clampInt(m.height-9, 5, 18)
+		}
+		if sel < scroll {
+			scroll = sel
+		} else if sel >= scroll+visible {
+			scroll = sel - visible + 1
+		}
+		if scroll < 0 {
+			scroll = 0
+		}
+		end := scroll + visible
+		if end > n {
+			end = n
+		}
+
+		for i := scroll; i < end; i++ {
+			r := m.regItems[i]
+			name := strings.TrimSpace(r.Name)
+			if name == "" {
+				name = "(unnamed)"
+			}
+			desc := strings.TrimSpace(r.Description)
+			suffix := ""
+			if desc != "" {
+				suffix = " — " + desc
+			}
+			prefix := "   "
+			if i == sel {
+				prefix = " > "
+			}
+			b.WriteString(fmt.Sprintf("%s%2d) %s%s\n", prefix, i+1, name, suffix))
+		}
+		if end < n {
+			b.WriteString(fmt.Sprintf("... and %d more\n", n-end))
+		}
+
+		b.WriteString("\n")
+		b.WriteString("Enter: paste (no Enter) • Esc/q: close • j/k: move\n")
+
+		return b.String()
+	}
 
 	// Network view overlay (LLDP topology)
 	if m.showNetworkView {
@@ -7957,6 +8251,16 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 func maxInt(a, b int) int {
 	if a > b {

@@ -34,6 +34,18 @@ var (
 	flagTUISource string // "yaml" (default) or "ssh"
 	flagSSHConfig string // comma-separated paths; defaults to ~/.ssh/config when empty
 
+	// DEPRECATED: built-in fzf mode is intentionally kept minimal. In practice, interactive
+	// pickers are more reliable when managed by the caller (zsh widgets, tmux popups, etc).
+	// Prefer:
+	//   tmux-ssh-manager pick --tui-source ssh
+	//   tmux-ssh-manager --tui-source ssh --list-fzf | fzf ... | cut -f1
+	flagUseFZF   bool
+	flagFZFPrint bool
+
+	// Optional: print tab-delimited candidates for external fzf/ZLE integration (no UI, no connect).
+	// Output format: "<hostKey>\t<display...>" (one per line).
+	flagListFZF bool
+
 	flagSplitCount  int
 	flagSplitLayout string
 	flagSplitMode   string
@@ -56,6 +68,10 @@ func init() {
 	flag.StringVar(&flagTUISource, "tui-source", "yaml", "TUI source: yaml|ssh")
 	flag.StringVar(&flagSSHConfig, "ssh-config", "", "SSH config path(s), comma-separated (default: ~/.ssh/config)")
 
+	flag.BoolVar(&flagUseFZF, "fzf", false, "DEPRECATED: built-in fzf picker (fragile in some terminals/widgets). Prefer `tmux-ssh-manager pick` or `--list-fzf` + external fzf")
+	flag.BoolVar(&flagFZFPrint, "fzf-print", false, "With --fzf: print selected host key(s) and exit (no connect).")
+	flag.BoolVar(&flagListFZF, "list-fzf", false, "Print fzf candidates as: <hostKey>\\t<display> (no UI, no connect). Intended for zsh widgets to run fzf safely and then exec/connect.")
+
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "tmux-ssh-manager\n\n")
 		fmt.Fprintf(os.Stderr, "Usage:\n")
@@ -69,10 +85,14 @@ func init() {
 		fmt.Fprintf(os.Stderr, `
 Examples:
   tmux-ssh-manager
-  tmux-ssh-manager --tui-source ssh
-  tmux-ssh-manager --tui-source ssh --ssh-config ~/.ssh/config,~/.ssh/config.d/*.conf
+  tmux-ssh-manager pick --tui-source ssh                # widget-safe: prints selected host key and exits
+  tmux-ssh-manager --tui-source ssh --list-fzf | fzf --delimiter=$'\t' --with-nth=2.. | cut -f1
   tmux-ssh-manager --host user@host -- -p 2222
   tmux-ssh-manager cred set --host leaf01.lab.local
+
+Deprecated:
+  tmux-ssh-manager --fzf
+  tmux-ssh-manager --tui-source ssh --fzf
 `)
 	}
 }
@@ -83,6 +103,13 @@ func main() {
 
 	if flag.NArg() >= 1 {
 		switch flag.Arg(0) {
+		case "pick":
+			if err := runPickSubcommand(flag.Args()[1:]); err != nil {
+				fmt.Fprintf(os.Stderr, "tmux-ssh-manager: %v\n", err)
+				os.Exit(exitCodeFromErr(err))
+			}
+			return
+
 		case "__askpass":
 			if err := runAskpassSubcommand(flag.Args()[1:]); err != nil {
 				fmt.Fprintf(os.Stderr, "tmux-ssh-manager: %v\n", err)
@@ -244,6 +271,23 @@ func main() {
 		return
 	}
 
+	if flagListFZF {
+		if cfg == nil || len(cfg.Hosts) == 0 {
+			if strings.EqualFold(flagTUISource, "ssh") {
+				fmt.Println("(no SSH aliases found)")
+			} else {
+				fmt.Println("(no hosts found in configuration)")
+			}
+			return
+		}
+		for _, h := range cfg.Hosts {
+			r := cfg.ResolveEffective(h)
+			// host key first (stable), then a display string for fzf to show.
+			fmt.Printf("%s\t%s\n", strings.TrimSpace(r.Host.Name), strings.TrimSpace(hostLine(r)))
+		}
+		return
+	}
+
 	if flagList {
 		if cfg == nil || len(cfg.Hosts) == 0 {
 			if strings.EqualFold(flagTUISource, "ssh") {
@@ -278,11 +322,125 @@ func main() {
 		return
 	}
 
-	// TUI mode
+	// TUI mode (default) or fzf picker mode (optional)
 	if cfg == nil {
 		fmt.Fprintln(os.Stderr, "tmux-ssh-manager: no configuration available for TUI mode")
 		os.Exit(1)
 	}
+
+	// Optional: fzf-based multi-select picker.
+	// - DEPRECATED: prefer `pick` (widget-safe print-only) or external fzf using `--list-fzf`.
+	// - Lets fzf own Spacebar (toggle selection) while allowing spaces in the query for multi-term filtering.
+	// - Returns 0..N selected host keys, one per line.
+	if flagUseFZF {
+		// Outside tmux, terminal integrations (notably iTerm2) can leave reply sequences
+		// (OSC/DSR/CPR responses) queued in the TTY input buffer. If not cleared, they can
+		// be consumed by fzf as initial query text (e.g. "11;rgb:...").
+		//
+		// Best-effort: only do this when not in tmux.
+		if strings.TrimSpace(os.Getenv("TMUX")) == "" {
+			flushTTYInput()
+		}
+
+		// Also proactively drain any pending bytes from our stdin (best-effort) so they
+		// cannot become the initial query inside fzf.
+		//
+		// This is especially important when launched from ZLE/widgets where terminal reply
+		// sequences can be left queued on the input stream.
+		{
+			fd := int(os.Stdin.Fd())
+			if term.IsTerminal(fd) {
+				_ = syscall.SetNonblock(fd, true)
+				buf := make([]byte, 512)
+				for {
+					n, rerr := os.Stdin.Read(buf)
+					if n <= 0 || rerr != nil {
+						break
+					}
+				}
+				_ = syscall.SetNonblock(fd, false)
+			}
+		}
+
+		hosts := cfg.Hosts
+		if len(hosts) == 0 {
+			fmt.Fprintln(os.Stderr, "tmux-ssh-manager: no hosts available")
+			os.Exit(1)
+		}
+
+		// Prepare fzf input: show a friendly line, but keep the host key as the first field.
+		// We later parse the selected lines and take field[0] as the host key.
+		lines := make([]string, 0, len(hosts))
+		for _, h := range hosts {
+			r := cfg.ResolveEffective(h)
+			// hostLine includes user/port/jump in a readable way; prefix with host key for stable parsing.
+			lines = append(lines, strings.TrimSpace(r.Host.Name)+"\t"+hostLine(r))
+		}
+
+		selectedKeys, err := runFZFMultiSelect(lines, flagInitialQuery)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "tmux-ssh-manager: fzf: %v\n", err)
+			os.Exit(exitCodeFromErr(err))
+		}
+
+		// No selection: exit cleanly.
+		if len(selectedKeys) == 0 {
+			return
+		}
+
+		// Print-only mode (no connect). Useful for shells that want to exec:
+		//   exec tmux-ssh-manager ssh --tmux? --host "<key>"
+		if flagFZFPrint {
+			for _, k := range selectedKeys {
+				fmt.Println(strings.TrimSpace(k))
+			}
+			return
+		}
+
+		// Outside tmux: only allow a single selection (consistent with existing multi-select limitations).
+		if strings.TrimSpace(os.Getenv("TMUX")) == "" {
+			if len(selectedKeys) != 1 {
+				fmt.Fprintln(os.Stderr, "tmux-ssh-manager: multi-select connect requires tmux (panes/windows). Start tmux or select a single host.")
+				os.Exit(1)
+			}
+			// Resolve by name; if not found, treat as literal destination.
+			if h := cfg.HostByName(selectedKeys[0]); h != nil {
+				r := cfg.ResolveEffective(*h)
+				if err := runDirectConnect(cfg, r.Host.Name, flagExecReplace, flagDryRun, sshArgs); err != nil {
+					fmt.Fprintf(os.Stderr, "tmux-ssh-manager: %v\n", err)
+					os.Exit(exitCodeFromErr(err))
+				}
+				return
+			}
+			// Fallback literal
+			if err := runDirectConnect(cfg, selectedKeys[0], flagExecReplace, flagDryRun, sshArgs); err != nil {
+				fmt.Fprintf(os.Stderr, "tmux-ssh-manager: %v\n", err)
+				os.Exit(exitCodeFromErr(err))
+			}
+			return
+		}
+
+		// In tmux: open each selection in a new window, with split fallback (mirrors Enter behavior).
+		failed := 0
+		for _, key := range selectedKeys {
+			if h := cfg.HostByName(key); h != nil {
+				r := cfg.ResolveEffective(*h)
+				if err := runDirectConnectWithSplits(cfg, r.Host.Name, 1, "window", "", flagExecReplace, flagDryRun, sshArgs); err != nil {
+					failed++
+				}
+				continue
+			}
+			// If not found in config, treat as literal destination.
+			if err := runDirectConnectWithSplits(cfg, key, 1, "window", "", flagExecReplace, flagDryRun, sshArgs); err != nil {
+				failed++
+			}
+		}
+		if failed > 0 {
+			os.Exit(1)
+		}
+		return
+	}
+
 	opts := manager.UIOptions{
 		InitialQuery: flagInitialQuery,
 		ExecReplace:  flagExecReplace,
@@ -705,7 +863,21 @@ func runSSHWrapperSubcommand(cfg *manager.Config, args []string, execReplace boo
 	// Additionally, if we intend to use __connect, ensure a credential is actually available
 	// (fail closed to normal ssh if not).
 	useConnect := false
-	credLookupHostKey := strings.TrimSpace(effectiveHostName) // credential host key: use effective HostName if present
+
+	// Credential lookup host key:
+	//
+	// IMPORTANT:
+	// For JumpHost/ProxyJump connections, `ssh -G` often yields the *final* HostName.
+	// But the TUI (and users) typically store credentials under the configured host key/alias.
+	//
+	// So, when we have a resolved config host, prefer that stable key; otherwise fall back
+	// to ssh -G's HostName (effectiveHostName).
+	credLookupHostKey := strings.TrimSpace(effectiveHostName) // default: use effective HostName if present
+	if resolved != nil {
+		if hk := strings.TrimSpace(resolved.Host.Name); hk != "" {
+			credLookupHostKey = hk
+		}
+	}
 
 	// IMPORTANT:
 	// Prefer the resolved effective user (from config/ssh config) for credential lookups.
@@ -899,31 +1071,141 @@ func runConnectSubcommand(args []string) error {
 		return errors.New("usage: tmux-ssh-manager __connect --host <alias> [--user <user>]")
 	}
 
-	// Retrieve password from Keychain (macOS) in-memory.
-	pw, err := manager.CredReveal(host, user, "password")
-	if err != nil {
-		return fmt.Errorf("__connect: credential missing/unavailable for %s: %w", host, err)
+	// Resolve effective ssh config from ssh -G so we can honor ProxyJump (and user/port if present).
+	eff := sshEffectiveConfig(host)
+
+	// Debug logging (non-secret) for multi-hop prompt injection.
+	// Enable by setting TMUX_SSH_MANAGER_CONNECT_DEBUG=1 (or any non-empty value).
+	connectDebug := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_CONNECT_DEBUG")) != ""
+
+	// Retrieve secrets (best-effort, non-fatal per-step):
+	// - Jump host credential: used for the first prompt if ProxyJump is set and requires password auth.
+	// - Destination credential: used for the next prompt (the intended target).
+	//
+	// NOTE:
+	// - We can't reliably disambiguate which prompt belongs to which hop based solely on output text.
+	// - In practice, OpenSSH prompts for the jump host first (when password-based), then the destination.
+	// - So we inject in order: jump (if available) -> destination (if available).
+	var jumpPw string
+	var destPw string
+
+	// Track (non-secret) which credential corresponds to which hop for debug.
+	jumpHostKeyForDebug := ""
+	jumpUserForDebug := ""
+	destHostKeyForDebug := strings.TrimSpace(host)
+	destUserForDebug := strings.TrimSpace(user)
+
+	// Jump credential (if ProxyJump is configured)
+	if pj := strings.TrimSpace(eff.ProxyJump); pj != "" && !strings.EqualFold(pj, "none") {
+		jumpHostKey := pj
+		jumpUser := ""
+		// ProxyJump may contain "user@host" or a host alias.
+		if at := strings.IndexByte(jumpHostKey, '@'); at >= 0 {
+			jumpUser = strings.TrimSpace(jumpHostKey[:at])
+			jumpHostKey = strings.TrimSpace(jumpHostKey[at+1:])
+		}
+		jumpHostKey = strings.TrimSpace(jumpHostKey)
+		if jumpHostKey != "" {
+			// Prefer ssh -G for jump user if not explicitly provided.
+			if jumpUser == "" {
+				if ju := strings.TrimSpace(sshEffectiveConfig(jumpHostKey).User); ju != "" {
+					jumpUser = ju
+				}
+			}
+			if pw, e := manager.CredReveal(jumpHostKey, jumpUser, "password"); e == nil {
+				jumpPw = pw
+				jumpHostKeyForDebug = jumpHostKey
+				jumpUserForDebug = jumpUser
+			} else if connectDebug {
+				fmt.Fprintf(os.Stderr, "tmux-ssh-manager __connect: jump credential missing/unavailable for host=%q user=%q (will not auto-inject jump prompt)\n", jumpHostKey, jumpUser)
+			}
+		}
+	}
+
+	// Destination credential (required for full automation; if missing we will still connect but may prompt)
+	if pw, e := manager.CredReveal(host, user, "password"); e == nil {
+		destPw = pw
+	} else if connectDebug {
+		fmt.Fprintf(os.Stderr, "tmux-ssh-manager __connect: destination credential missing/unavailable for host=%q user=%q (will not auto-inject destination prompt)\n", host, user)
+	}
+
+	type pendingSecret struct {
+		secret   string
+		hopLabel string // non-secret label for debug
+		hostKey  string // non-secret
+		username string // non-secret
+	}
+	secrets := []pendingSecret{}
+	if strings.TrimSpace(jumpPw) != "" {
+		secrets = append(secrets, pendingSecret{
+			secret:   jumpPw,
+			hopLabel: "jump",
+			hostKey:  jumpHostKeyForDebug,
+			username: jumpUserForDebug,
+		})
+	}
+	if strings.TrimSpace(destPw) != "" {
+		secrets = append(secrets, pendingSecret{
+			secret:   destPw,
+			hopLabel: "dest",
+			hostKey:  destHostKeyForDebug,
+			username: destUserForDebug,
+		})
+	}
+
+	if connectDebug {
+		pj := strings.TrimSpace(eff.ProxyJump)
+		fmt.Fprintf(os.Stderr, "tmux-ssh-manager __connect: host=%q user=%q proxyjump=%q secrets=%d\n", host, user, pj, len(secrets))
+		for i, s := range secrets {
+			fmt.Fprintf(os.Stderr, "tmux-ssh-manager __connect: secret[%d]=%s host=%q user=%q\n", i, s.hopLabel, s.hostKey, s.username)
+		}
 	}
 
 	// Build ssh argv. Keep it conservative: prefer keyboard-interactive/password.
+	//
+	// IMPORTANT:
+	// When the destination is configured to use a jump host (ProxyJump / -J),
+	// we must pass that into this PTY-mediated connector as well.
 	dest := host
 	if user != "" {
 		dest = user + "@" + dest
 	}
+
 	argv := []string{
 		"ssh",
 		"-o", "PreferredAuthentications=keyboard-interactive,password",
 		"-o", "PubkeyAuthentication=no",
-		"-o", "NumberOfPasswordPrompts=1",
-		dest,
+		// Allow two prompts (jump + destination). If only one is needed, ssh will stop early.
+		"-o", "NumberOfPasswordPrompts=2",
 	}
 
-	// Start ssh under a PTY so we can detect prompts and inject the password.
+	// Honor ProxyJump from ssh config when present.
+	// Note: OpenSSH prints "proxyjump none" when unset.
+	if pj := strings.TrimSpace(eff.ProxyJump); pj != "" && !strings.EqualFold(pj, "none") {
+		argv = append(argv, "-J", pj)
+	}
+
+	// Honor Port from ssh config if present (best-effort).
+	if eff.Port > 0 && eff.Port != 22 {
+		argv = append(argv, "-p", strconv.Itoa(eff.Port))
+	}
+
+	argv = append(argv, dest)
+
+	// Flush any pending terminal replies (e.g. OSC/DSR responses from terminal integrations)
+	// so they don't get consumed as "typed input" by the next interactive program (ssh/fzf).
+	//
+	// tmux tends to absorb/normalize some of this; outside tmux it can leak into the tty input buffer.
 	//
 	// IMPORTANT:
-	// If we don't explicitly propagate the current terminal window size into the PTY,
-	// some environments (notably when invoked via wrappers/aliases/tmux) can end up with
-	// a 0x0 PTY size on the remote side (rows 0; columns 0), which breaks full-screen apps.
+	// - Flush BEFORE putting stdin into raw mode and BEFORE starting the PTY.
+	// - Also do a short best-effort drain to catch bytes that arrive right after the flush.
+	//   (Some terminal integrations emit queries/replies around prompt redraw or mode switches.)
+	if os.Getenv("TMUX") == "" {
+		flushTTYInput()
+	}
+
+	// Start ssh under a PTY so we can detect prompts and inject secrets.
 	cmd := exec.Command(argv[0], argv[1:]...)
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
@@ -932,7 +1214,6 @@ func runConnectSubcommand(args []string) error {
 	defer func() { _ = ptmx.Close() }()
 
 	// Seed PTY size from our current stdout terminal (best-effort).
-	// (stdout is what the user is actually looking at; stdin might not be a tty in some setups)
 	if term.IsTerminal(int(os.Stdout.Fd())) {
 		if cols, rows, sizeErr := term.GetSize(int(os.Stdout.Fd())); sizeErr == nil && rows > 0 && cols > 0 {
 			_ = pty.Setsize(ptmx, &pty.Winsize{
@@ -943,15 +1224,9 @@ func runConnectSubcommand(args []string) error {
 	}
 
 	// Keep PTY size updated on window resize, best-effort.
-	//
-	// IMPORTANT:
-	// - Do not reference syscall.SIGWINCH in the main build, because some build targets (notably Windows)
-	//   do not define it and will fail to compile even if the code path is guarded.
-	// - We delegate to a helper that is implemented per-OS via build tags.
 	startPTYResizeWatcher(ptmx)
 
-	// Disable local terminal echo so anything the user types (including password) isn't echoed locally.
-	// This does NOT prevent the remote from echoing; it prevents local tty echo.
+	// Disable local terminal echo so anything the user types (including passwords) isn't echoed locally.
 	if fd := int(os.Stdin.Fd()); term.IsTerminal(fd) {
 		oldState, sErr := term.MakeRaw(fd)
 		if sErr == nil {
@@ -963,9 +1238,14 @@ func runConnectSubcommand(args []string) error {
 
 	// Expect-like prompt detection:
 	// - Match common password prompts even when they are not newline-terminated.
-	// - Respond once with password + CR.
-	promptRe := regexp.MustCompile(`(?i)(password|passcode|pass phrase|passphrase)\s*:?\s*$`)
-	seenPrompt := false
+	// - Respond up to len(secrets) times with the next secret + CR.
+	//
+	// More robust matching:
+	// - Some prompts are not line-terminated and may be immediately followed by echoed text.
+	// - Some include a "user@host's password:" prefix (OpenSSH style).
+	// - Some are in the form "(user@host) Password:" (common PAM/ssh banners).
+	promptRe := regexp.MustCompile(`(?i)(^|\s|\(|'|"|@)(password|passcode|pass phrase|passphrase)\s*:?\s*$`)
+	injected := 0
 
 	// Copy user input -> ssh PTY (interactive session)
 	go func() {
@@ -975,7 +1255,7 @@ func runConnectSubcommand(args []string) error {
 	// Read ssh output, mirror to user, and detect prompts.
 	buf := make([]byte, 4096)
 	var tail strings.Builder
-	deadline := time.Now().Add(30 * time.Second) // prompt detection window
+	deadline := time.Now().Add(45 * time.Second) // prompt detection window (two-hop can be slower)
 	const maxTail = 2048
 
 	for {
@@ -1004,19 +1284,42 @@ func runConnectSubcommand(args []string) error {
 				}
 			}
 
-			if !seenPrompt && time.Now().Before(deadline) {
-				// Only examine the last line-ish segment of tail
+			if injected < len(secrets) && time.Now().Before(deadline) {
+				// Only examine the last "line-ish" segment of tail, but keep it tolerant of
+				// prompts that don't end with a newline.
 				s := tail.String()
 				if idx := strings.LastIndexByte(s, '\n'); idx >= 0 && idx+1 < len(s) {
 					s = s[idx+1:]
 				}
 				s = strings.TrimSpace(s)
-				if promptRe.MatchString(s) {
-					seenPrompt = true
 
-					// Send password + CR (not LF) to match typical SSH password entry behavior.
-					_, _ = ptmx.Write([]byte(pw))
+				// Reliability tweak:
+				// If the prompt and the next output are glued together (no newline), we may
+				// end up with a string like:
+				//   "admin@10.192.246.70's password:Debian GNU/Linux 11"
+				// In that case, attempt to split at the first ":" and only match the prompt side.
+				sPrompt := s
+				if c := strings.IndexByte(sPrompt, ':'); c >= 0 {
+					left := strings.TrimSpace(sPrompt[:c+1])
+					// Only prefer the left side if it looks like it contains a password keyword.
+					if strings.Contains(strings.ToLower(left), "pass") {
+						sPrompt = left
+					}
+				}
+
+				if promptRe.MatchString(sPrompt) {
+					if connectDebug {
+						fmt.Fprintf(os.Stderr, "tmux-ssh-manager __connect: detected password prompt (idx=%d/%d) tail=%q prompt=%q using=%s host=%q user=%q\n",
+							injected, len(secrets), s, sPrompt, secrets[injected].hopLabel, secrets[injected].hostKey, secrets[injected].username)
+					}
+
+					// Send next secret + CR (not LF) to match typical SSH password entry behavior.
+					_, _ = ptmx.Write([]byte(secrets[injected].secret))
 					_, _ = ptmx.Write([]byte("\r"))
+					injected++
+
+					// Clear the tail after injection to reduce false re-matches on the same prompt.
+					tail.Reset()
 				}
 			}
 		}
@@ -1584,12 +1887,16 @@ type sshEffective struct {
 	User     string
 	HostName string
 	Port     int
+
+	// ProxyJump is the effective jump host chain (as emitted by `ssh -G`, key: "proxyjump").
+	// OpenSSH prints "proxyjump none" when unset.
+	ProxyJump string
 }
 
 // sshEffectiveConfig attempts to resolve effective SSH configuration for a host/alias using
 // the user's ssh configuration by invoking `ssh -G <host>` and parsing the output.
 //
-// It is intentionally minimal (we only parse user/hostname/port), but it respects includes and
+// It is intentionally minimal (we only parse user/hostname/port/proxyjump), but it respects includes and
 // Match blocks because OpenSSH performs the evaluation.
 //
 // If a value cannot be determined, it is left empty/zero.
@@ -1632,6 +1939,12 @@ func sshEffectiveConfig(host string) sshEffective {
 					eff.Port = p
 				}
 			}
+		case "proxyjump":
+			// OpenSSH prints "proxyjump none" when unset.
+			// Preserve the raw value so callers can decide whether to emit -J.
+			if eff.ProxyJump == "" {
+				eff.ProxyJump = strings.TrimSpace(parts[1])
+			}
 		}
 	}
 	return eff
@@ -1660,4 +1973,201 @@ func exitCodeFromErr(err error) int {
 		}
 	}
 	return 1
+}
+
+// runFZFMultiSelect runs `fzf` in multi-select mode and returns selected host keys.
+// Input lines are expected to be: "<hostKey>\t<display...>".
+// We return the first field (hostKey) for each selected line.
+func runFZFMultiSelect(lines []string, initialQuery string) ([]string, error) {
+	// Require fzf on PATH.
+	if _, err := exec.LookPath("fzf"); err != nil {
+		return nil, fmt.Errorf("fzf not found in PATH")
+	}
+
+	// Make fzf behave more like the zsh Ctrl-R widget:
+	// - Use "height mode" so it renders as a dropdown *below the cursor* instead of full-screen.
+	// - Use reverse layout so the prompt is at the bottom (fzf default UX for Ctrl-R).
+	// - Add a border for readability.
+	args := []string{
+		"--multi",
+		"--ansi",
+		"--tiebreak=index",
+		"--delimiter=\t",
+		"--with-nth=2..",
+		"--height", "~40%",
+		"--layout", "reverse",
+		"--border",
+	}
+	if strings.TrimSpace(initialQuery) != "" {
+		args = append(args, "--query", strings.TrimSpace(initialQuery))
+	}
+
+	// Conservative environment: avoid terminal integrations influencing behavior.
+	env := append([]string{}, os.Environ()...)
+	// Strip iTerm2 shell integration env vars that can trigger extra queries/replies.
+	env = append(env,
+		"ITERM_SESSION_ID=",
+		"ITERM_PROFILE=",
+		"ITERM_PROFILE_NAME=",
+		"ITERM2_PROFILE=",
+	)
+	// Force a conservative TERM for predictable termcap behavior.
+	env = append(env, "TERM=xterm")
+
+	// Feed candidates via a pipe (so they are not echoed to the screen).
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = inR.Close() }()
+	go func() {
+		defer func() { _ = inW.Close() }()
+		for _, ln := range lines {
+			ln = strings.TrimRight(ln, "\r\n")
+			if ln == "" {
+				continue
+			}
+			_, _ = io.WriteString(inW, ln)
+			_, _ = io.WriteString(inW, "\n")
+		}
+		_, _ = io.WriteString(inW, "\n")
+	}()
+
+	// Preferred: tty-attached fzf (widget-safe). fzf reads keys from /dev/tty when stderr is a tty.
+	tty, ttyErr := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if ttyErr == nil {
+		defer func() { _ = tty.Close() }()
+
+		cmd := exec.Command("fzf", args...)
+		cmd.Env = env
+		cmd.Stdin = inR
+		cmd.Stderr = tty
+
+		var outBuf strings.Builder
+		cmd.Stdout = &outBuf
+
+		if err := cmd.Run(); err != nil {
+			if _, ok := err.(*exec.ExitError); ok {
+				return nil, nil
+			}
+			return nil, err
+		}
+
+		raw := strings.TrimSpace(outBuf.String())
+		if raw == "" {
+			return nil, nil
+		}
+
+		var keys []string
+		for _, ln := range strings.Split(raw, "\n") {
+			ln = strings.TrimSpace(ln)
+			if ln == "" {
+				continue
+			}
+			parts := strings.SplitN(ln, "\t", 2)
+			key := strings.TrimSpace(parts[0])
+			if key != "" {
+				keys = append(keys, key)
+			}
+		}
+		return keys, nil
+	}
+
+	// Last resort: non-interactive mode.
+	cmd := exec.Command("fzf", args...)
+	cmd.Env = env
+	cmd.Stdin = strings.NewReader(strings.Join(lines, "\n"))
+	out, err := cmd.Output()
+	if err != nil {
+		if _, ok := err.(*exec.ExitError); ok {
+			return nil, nil
+		}
+		return nil, err
+	}
+	raw := strings.TrimSpace(string(out))
+	if raw == "" {
+		return nil, nil
+	}
+	var keys []string
+	for _, ln := range strings.Split(raw, "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		parts := strings.SplitN(ln, "\t", 2)
+		key := strings.TrimSpace(parts[0])
+		if key != "" {
+			keys = append(keys, key)
+		}
+	}
+	return keys, nil
+}
+
+// runPickSubcommand is a widget-safe selector:
+// - prints exactly one selected host key (single line) and exits 0
+// - prints nothing and exits 0 on cancel/no selection
+// - never starts ssh (caller is responsible for running `tmux-ssh-manager ssh --host <key>` with proper tty wiring)
+func runPickSubcommand(args []string) error {
+	fs := flag.NewFlagSet("pick", flag.ContinueOnError)
+	var source string
+	var sshConfig string
+	var initialQuery string
+	fs.StringVar(&source, "tui-source", "yaml", "TUI source: yaml|ssh")
+	fs.StringVar(&sshConfig, "ssh-config", "", "SSH config path(s), comma-separated (default: ~/.ssh/config)")
+	fs.StringVar(&initialQuery, "query", "", "Initial query for fzf")
+	fs.SetOutput(os.Stderr)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	// Load config
+	var cfg *manager.Config
+	if strings.EqualFold(strings.TrimSpace(source), "ssh") {
+		var sshPaths []string
+		if strings.TrimSpace(sshConfig) != "" {
+			for _, p := range strings.Split(sshConfig, ",") {
+				p = strings.TrimSpace(p)
+				if p != "" {
+					sshPaths = append(sshPaths, p)
+				}
+			}
+		}
+		conf, err := manager.LoadConfigFromSSH(sshPaths...)
+		if err != nil {
+			return err
+		}
+		cfg = conf
+	} else {
+		conf, _, err := manager.LoadConfig(flagConfig)
+		if err != nil {
+			return err
+		}
+		cfg = conf
+	}
+
+	if cfg == nil || len(cfg.Hosts) == 0 {
+		return nil
+	}
+
+	// Prepare fzf input: "<hostKey>\t<display...>"
+	lines := make([]string, 0, len(cfg.Hosts))
+	for _, h := range cfg.Hosts {
+		r := cfg.ResolveEffective(h)
+		lines = append(lines, strings.TrimSpace(r.Host.Name)+"\t"+hostLine(r))
+	}
+
+	if _, err := exec.LookPath("fzf"); err != nil {
+		// No fzf installed; be silent (widget can decide fallback behavior).
+		return nil
+	}
+
+	selectedKeys, err := runFZFMultiSelect(lines, initialQuery)
+	if err != nil {
+		return err
+	}
+	if len(selectedKeys) == 0 {
+		return nil
+	}
+	fmt.Println(strings.TrimSpace(selectedKeys[0]))
+	return nil
 }

@@ -10,6 +10,7 @@ CONFIG_PATH="$(tmux show -gqv @tmux_ssh_manager_config || true)"
 TUI_SOURCE="$(tmux show -gqv @tmux_ssh_manager_tui_source || true)"
 SSH_CONFIG_OPT="$(tmux show -gqv @tmux_ssh_manager_ssh_config || true)"
 LAUNCH_MODE="$(tmux show -gqv @tmux_ssh_manager_launch_mode || true)"
+PICKER_MODE="$(tmux show -gqv @tmux_ssh_manager_picker || true)"
 
 GPG_SYMMETRIC_OPT="$(tmux show -gqv @tmux_ssh_manager_gpg_symmetric || true)"
 GPG_PASSPHRASE_FILE_OPT="$(tmux show -gqv @tmux_ssh_manager_gpg_passphrase_file || true)"
@@ -90,6 +91,16 @@ else
   if [[ -n "${SSH_CONFIG_OPT}" ]]; then
     CMD_STR+=" --ssh-config \"${SSH_CONFIG_OPT}\""
   fi
+fi
+
+# Optional picker:
+# - tui (default): built-in Bubble Tea UI
+# - fzf: external fuzzy picker with multi-select (space toggles selection inside fzf; space allowed in query)
+if [[ -z "${PICKER_MODE}" ]]; then
+  PICKER_MODE="tui"
+fi
+if [[ "${PICKER_MODE}" == "fzf" ]]; then
+  CMD_STR+=" --fzf"
 fi
 
 if ! tmux display-message -d 1 "tmux-ssh-manager: starting" >/dev/null 2>&1; then

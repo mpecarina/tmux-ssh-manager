@@ -40,6 +40,10 @@ type Dashboard struct {
 	// Default behavior: if unset/0, callers should use a sensible default (e.g. 500ms).
 	ConnectDelayMS int        `yaml:"connect_delay_ms,omitempty"`
 	Panes          []DashPane `yaml:"panes"`
+
+	// Registers references named command sequences that are scoped to this dashboard’s hosts.
+	// These are exposed by the UI as quick paste actions for panes belonging to those hosts.
+	Registers []string `yaml:"registers,omitempty"`
 }
 
 // DashPane describes one pane of a dashboard.
@@ -113,15 +117,21 @@ func (c *Config) ValidateDashboards() error {
 		if len(d.Panes) == 0 {
 			return fmt.Errorf("dashboards[%d](%s): at least one pane is required", i, name)
 		}
+
+		// validate connect_delay_ms (dashboard-level)
+		if d.ConnectDelayMS < 0 {
+			return fmt.Errorf("dashboards[%d](%s).connect_delay_ms: must be >= 0", i, name)
+		}
+
+		// validate register references (dashboard-level)
+		// Register names are validated at runtime when the active host is known (host-scoped registers).
+
 		for j, p := range d.Panes {
 			if strings.TrimSpace(p.Host) == "" && !p.Filter.hasAnyCriterion() {
 				return fmt.Errorf("dashboards[%d](%s).panes[%d]: specify either host or filter", i, name, j)
 			}
 
-			// validate connect_delay_ms (dashboard + pane override)
-			if d.ConnectDelayMS < 0 {
-				return fmt.Errorf("dashboards[%d](%s).connect_delay_ms: must be >= 0", i, name)
-			}
+			// validate connect_delay_ms (pane override)
 			if p.ConnectDelayMS < 0 {
 				return fmt.Errorf("dashboards[%d](%s).panes[%d].connect_delay_ms: must be >= 0", i, name, j)
 			}
