@@ -1839,7 +1839,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 
 			case "j", "down":
-				// Uniform vim-ish navigation for this modal: j/k move between fields.
+				// If an input field is focused, forward the key to it.
+				if m.addSSHAlias.Focused() {
+					var cmd tea.Cmd
+					m.addSSHAlias, cmd = m.addSSHAlias.Update(msg)
+					return m, cmd
+				}
+				if m.addSSHHostName.Focused() {
+					var cmd tea.Cmd
+					m.addSSHHostName, cmd = m.addSSHHostName.Update(msg)
+					return m, cmd
+				}
+				if m.addSSHUser.Focused() {
+					var cmd tea.Cmd
+					m.addSSHUser, cmd = m.addSSHUser.Update(msg)
+					return m, cmd
+				}
+				if m.addSSHPort.Focused() {
+					var cmd tea.Cmd
+					m.addSSHPort, cmd = m.addSSHPort.Update(msg)
+					return m, cmd
+				}
+				if m.addSSHProxyJump.Focused() {
+					var cmd tea.Cmd
+					m.addSSHProxyJump, cmd = m.addSSHProxyJump.Update(msg)
+					return m, cmd
+				}
+				if m.addSSHIdentityFile.Focused() {
+					var cmd tea.Cmd
+					m.addSSHIdentityFile, cmd = m.addSSHIdentityFile.Update(msg)
+					return m, cmd
+				}
+				// No input focused – perform field navigation.
 				m.pendingG = false
 				m.numBuf = ""
 				if m.addSSHFieldSel < 6 {
@@ -1848,6 +1879,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 
 			case "k", "up":
+				// If an input field is focused, forward the key to it.
+				if m.addSSHAlias.Focused() {
+					var cmd tea.Cmd
+					m.addSSHAlias, cmd = m.addSSHAlias.Update(msg)
+					return m, cmd
+				}
+				if m.addSSHHostName.Focused() {
+					var cmd tea.Cmd
+					m.addSSHHostName, cmd = m.addSSHHostName.Update(msg)
+					return m, cmd
+				}
+				if m.addSSHUser.Focused() {
+					var cmd tea.Cmd
+					m.addSSHUser, cmd = m.addSSHUser.Update(msg)
+					return m, cmd
+				}
+				if m.addSSHPort.Focused() {
+					var cmd tea.Cmd
+					m.addSSHPort, cmd = m.addSSHPort.Update(msg)
+					return m, cmd
+				}
+				if m.addSSHProxyJump.Focused() {
+					var cmd tea.Cmd
+					m.addSSHProxyJump, cmd = m.addSSHProxyJump.Update(msg)
+					return m, cmd
+				}
+				if m.addSSHIdentityFile.Focused() {
+					var cmd tea.Cmd
+					m.addSSHIdentityFile, cmd = m.addSSHIdentityFile.Update(msg)
+					return m, cmd
+				}
+				// No input focused – perform field navigation.
 				m.pendingG = false
 				m.numBuf = ""
 				if m.addSSHFieldSel > 0 {
