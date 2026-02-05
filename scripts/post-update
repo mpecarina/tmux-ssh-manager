@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN_DIR="${REPO_ROOT}/bin"
+BIN_PATH="${BIN_DIR}/tmux-ssh-manager"
+
+mkdir -p "${BIN_DIR}"
+
+if ! command -v go >/dev/null 2>&1; then
+  echo "tmux-ssh-manager: go not found; cannot rebuild ${BIN_PATH}" >&2
+  exit 1
+fi
+
+echo "tmux-ssh-manager: rebuilding ${BIN_PATH}"
+go build -o "${BIN_PATH}" ./cmd/tmux-ssh-manager
