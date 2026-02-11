@@ -6229,6 +6229,13 @@ func (m model) View() string {
 			}
 
 			line := m.theme.ListLine(i+1, i == m.selected, sel, m.isFavorite(name), display)
+			// Keep each host row to a single terminal line so the right-hand divider
+			// stays visually continuous (avoid wrapping).
+			if leftWidth > 0 {
+				line = lipgloss.NewStyle().Width(maxInt(0, leftWidth)).MaxWidth(maxInt(0, leftWidth)).
+					MaxHeight(1).
+					Render(line)
+			}
 			leftLines = append(leftLines, line)
 		}
 		if end < len(m.filtered) {
