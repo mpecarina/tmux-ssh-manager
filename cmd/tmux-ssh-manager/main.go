@@ -912,8 +912,8 @@ func runSSHWrapperSubcommand(cfg *manager.Config, args []string, execReplace boo
 
 	// If HostExtras didn't decide, fall back to YAML login_mode if present.
 	if !useConnect && resolved != nil {
-		lm := strings.ToLower(strings.TrimSpace(resolved.Host.LoginMode))
-		if lm == "askpass" {
+		loginMode := strings.ToLower(strings.TrimSpace(resolved.Host.LoginMode))
+		if loginMode == "askpass" {
 			useConnect = true
 			reason = "YAML login_mode=askpass"
 		}
@@ -1713,8 +1713,8 @@ func runSCPWrapperSubcommand(cfg *manager.Config, args []string, execReplace boo
 
 	// If HostExtras didn't decide, fall back to YAML login_mode if present.
 	if !useAskpass && resolved != nil {
-		lm := strings.ToLower(strings.TrimSpace(resolved.Host.LoginMode))
-		if lm == "askpass" {
+		loginMode := strings.ToLower(strings.TrimSpace(resolved.Host.LoginMode))
+		if loginMode == "askpass" {
 			useAskpass = true
 			reason = "YAML login_mode=askpass"
 		}

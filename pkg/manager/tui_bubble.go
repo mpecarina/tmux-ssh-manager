@@ -275,7 +275,7 @@ func newModel(cfg *Config, opts UIOptions) model {
 	// Add SSH Host form inputs (primary ~/.ssh/config)
 	ai := textinput.New()
 	ai.Prompt = "Alias: "
-	ai.Placeholder = "e.g. narrs-dev1.lmig.com"
+	ai.Placeholder = "e.g. narrs-dev1.example.com"
 	ai.CharLimit = 256
 
 	hni := textinput.New()
@@ -7413,9 +7413,9 @@ func collectLLDPForHost(cfg *Config, r ResolvedHost) (*LLDPParseResult, string, 
 			}
 		}
 		if effLoginMode == "manual" {
-			lm := strings.ToLower(strings.TrimSpace(r.Host.LoginMode))
-			if lm != "" {
-				effLoginMode = lm
+			loginMode := strings.ToLower(strings.TrimSpace(r.Host.LoginMode))
+			if loginMode != "" {
+				effLoginMode = loginMode
 			}
 		}
 
@@ -7993,11 +7993,11 @@ func (m *model) effectiveLoginMode(r ResolvedHost) string {
 		}
 	}
 
-	lm := strings.ToLower(strings.TrimSpace(r.Host.LoginMode))
-	if lm == "" {
+	loginMode := strings.ToLower(strings.TrimSpace(r.Host.LoginMode))
+	if loginMode == "" {
 		return "manual"
 	}
-	return lm
+	return loginMode
 }
 
 // (Askpass wrapper removed)
