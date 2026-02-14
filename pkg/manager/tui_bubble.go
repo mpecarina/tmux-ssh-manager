@@ -241,7 +241,7 @@ type model struct {
 	recents         []string
 	filterFavorites bool
 	filterRecents   bool
-	selectedSet     map[int]struct{}
+	selectedSet     map[string]struct{}
 
 	// tmux targets created during this session (to close on exit)
 	createdPaneIDs   []string
@@ -360,7 +360,7 @@ func newModel(cfg *Config, opts UIOptions) model {
 		recents:         []string{},
 		filterFavorites: false,
 		filterRecents:   false,
-		selectedSet:     make(map[int]struct{}),
+		selectedSet:     make(map[string]struct{}),
 
 		// network view defaults
 		showNetworkView:  false,
@@ -616,6 +616,13 @@ func (m *model) currentOrSelectedResolved() []ResolvedHost {
 		}
 	}
 	return targets
+}
+
+func hostKeyFromCandidate(c *candidate) string {
+	if c == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.Resolved.Host.Name)
 }
 
 func (m *model) findMacro(name string) *Macro {
@@ -4506,14 +4513,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if strings.TrimSpace(m.input.Value()) == "" {
 					m.input.Blur()
 					m.recomputeFilter()
-					if sel := m.current(); sel != nil {
-						if _, ok := m.selectedSet[m.selected]; ok {
-							delete(m.selectedSet, m.selected)
-						} else {
-							m.selectedSet[m.selected] = struct{}{}
-						}
-						m.setStatus(fmt.Sprintf("Selected: %d", m.selectedCount()), 1200)
-					}
+					m.toggleCurrentSelection()
 					return m, nil
 				}
 
@@ -5012,14 +5012,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case " ":
 			// toggle multi-select for current row
-			if sel := m.current(); sel != nil {
-				if _, ok := m.selectedSet[m.selected]; ok {
-					delete(m.selectedSet, m.selected)
-				} else {
-					m.selectedSet[m.selected] = struct{}{}
-				}
-				m.setStatus(fmt.Sprintf("Selected: %d", m.selectedCount()), 1200)
-			}
+			m.toggleCurrentSelection()
 			return m, nil
 		case "f":
 			// toggle favorite on current host
@@ -6218,8 +6211,8 @@ func (m model) View() string {
 			end = len(m.filtered)
 		}
 		for i := m.scroll; i < end; i++ {
-			_, sel := m.selectedSet[i]
 			name := m.filtered[i].Resolved.Host.Name
+			_, sel := m.selectedSet[name]
 
 			display := m.filtered[i].Display
 			if m.dupAliasCount != nil {
@@ -6484,14 +6477,36 @@ func (m *model) addRecent(name string) {
 func (m *model) selectedCount() int {
 	return len(m.selectedSet)
 }
+
+func (m *model) toggleCurrentSelection() {
+	sel := m.current()
+	if sel == nil {
+		return
+	}
+	k := hostKeyFromCandidate(sel)
+	if k == "" {
+		return
+	}
+	if _, ok := m.selectedSet[k]; ok {
+		delete(m.selectedSet, k)
+	} else {
+		m.selectedSet[k] = struct{}{}
+	}
+	m.setStatus(fmt.Sprintf("Selected: %d", m.selectedCount()), 1200)
+}
+
 func (m *model) selectedResolved() []ResolvedHost {
 	if len(m.selectedSet) == 0 {
 		return nil
 	}
 	out := make([]ResolvedHost, 0, len(m.selectedSet))
-	for idx := range m.selectedSet {
-		if idx >= 0 && idx < len(m.filtered) {
-			out = append(out, m.filtered[idx].Resolved)
+	for _, c := range m.candidates {
+		k := hostKeyFromCandidate(&c)
+		if k == "" {
+			continue
+		}
+		if _, ok := m.selectedSet[k]; ok {
+			out = append(out, c.Resolved)
 		}
 	}
 	return out
