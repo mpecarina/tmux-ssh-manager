@@ -1,5 +1,7 @@
 # tmux-ssh-manager
 
+Recorded demos live in `docs/demos/` (with regeneration instructions in `docs/README.md`).
+
 ## Registers (host-scoped, vim-like)
 
 Registers are named command lists you can paste into the active host’s pane without automatically pressing Enter. Registers are **resolved per host** (so different hosts can have different registers).

@@ -1,0 +1,33 @@
+# Demo inventory for recordings.
+#
+# Uses example domains per RFC 2606 and documentation IPs per RFC 5737/3849.
+# Do NOT put real hostnames, usernames, or secrets in this file.
+
+groups:
+  - name: demo-lab
+    default_user: demo
+    default_port: 22
+
+hosts:
+  - name: rtr1.demo.example
+    group: demo-lab
+    tags: [router, ios-xe]
+
+  - name: leaf01.demo.example
+    group: demo-lab
+    tags: [leaf, eos]
+
+  - name: fw1.demo.example
+    group: demo-lab
+    port: 2222
+    tags: [firewall]
+
+  - name: "192.0.2.10"
+    group: demo-lab
+    user: admin
+    tags: [ipv4, doc]
+
+  - name: "2001:db8::10"
+    group: demo-lab
+    user: v6user
+    tags: [ipv6, doc]
