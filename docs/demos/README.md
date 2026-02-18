@@ -1,16 +1,13 @@
 # Demos
 
-GitHub's Markdown viewer can't play terminal recordings directly.
+This folder contains reproducible, scriptable terminal demos as **VHS tapes** (`*.tape`) and rendered **GIFs** (`*.gif`).
 
-This folder keeps:
-
-- `*.tape` (VHS source scripts) and rendered `*.gif`/`*.mp4`/`*.webm` outputs (preferred)
-- `*.cast` (asciinema recordings; use for local playback)
+- Source (editable): `docs/demos/*.tape`
+- Output (displayed): `docs/demos/*.gif`
 
 ## View on GitHub
 
-- GIFs render inline in Markdown.
-- MP4/WEBM files can be downloaded; GitHub may not inline-play them in Markdown.
+GitHub renders GIFs inline, so the demos below should show up directly in the README.
 
 ### Rendered GIFs
 
@@ -22,22 +19,43 @@ This folder keeps:
 
 ![](./favorites-filter.gif)
 
-## Local playback
+## Regenerate (VHS)
 
-Asciinema:
+Prereqs (macOS):
+
+- `vhs` (which in turn requires `ttyd` and `ffmpeg` available on your PATH)
+- `go`
+- `tmux` (recommended: render from inside tmux so window/pane behaviors match real usage)
+
+Build the binary:
 
 ```sh
-asciinema play docs/demos/basic-flow.cast
-asciinema play docs/demos/favorites-filter.cast
+go build -o ./bin/tmux-ssh-manager ./cmd/tmux-ssh-manager
 ```
 
-VHS:
+Render the demos (recommended to run from inside tmux):
 
 ```sh
 brew install vhs
-go build -o ./bin/tmux-ssh-manager ./cmd/tmux-ssh-manager
 
-# Note: demos that open tmux windows must be rendered from inside tmux.
+# Note: demos that open tmux windows/panes should be rendered from inside a tmux session.
 vhs docs/demos/basic-flow.tape --output docs/demos/basic-flow.gif
 vhs docs/demos/favorites-filter.tape --output docs/demos/favorites-filter.gif
 ```
+
+## Notes / Troubleshooting
+
+### GIF looks static (all frames identical)
+
+This almost always means the tape isn’t performing any **visible** actions while recording (e.g., everything happens under `Hide`, or nothing happens after `Show`).
+
+Fix by ensuring the tape:
+
+- runs setup/build steps under `Hide` (optional),
+- then switches to `Show`,
+- and performs visible interactions (e.g., `Type`, navigation keys, `Enter`, plus `Sleep`/`Wait` between actions).
+
+### Keep demos safe
+
+- Use only demo config data (`docs/demos/hosts.demo.yaml`) and avoid recording secrets.
+- Avoid recording real infrastructure identifiers if the repo is public.

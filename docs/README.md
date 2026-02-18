@@ -1,19 +1,19 @@
 ## Docs
 
-This folder contains reproducible demo recordings (VHS tapes preferred; asciinema fallback).
+This folder contains reproducible demo recordings (VHS tapes) and rendered GIF outputs.
 
 ### Demos
 
 - `docs/demos/README.md` - How to view demos on GitHub + locally.
-- `docs/demos/basic-flow.cast` - Placeholder asciicast (regenerate locally; see below).
-- `docs/demos/favorites-filter.cast` - Placeholder asciicast (regenerate locally; see below).
+- `docs/demos/basic-flow.gif` - Basic flow demo (rendered from `docs/demos/basic-flow.tape`).
+- `docs/demos/favorites-filter.gif` - Favorites filter demo (rendered from `docs/demos/favorites-filter.tape`).
 
-### Regenerate recordings (asciinema)
+### Regenerate recordings (VHS)
 
 Prereqs (macOS):
 
-- `asciinema`
-- `tmux`
+- `vhs`
+- `tmux` (recommended: render from inside tmux so window/pane actions behave as expected)
 - `go` (to build `tmux-ssh-manager`)
 
 Build:
@@ -32,8 +32,10 @@ cp ./docs/demos/hosts.demo.yaml "$HOME/.config/tmux-ssh-manager/hosts.yaml"
 Record (run inside a tmux session; use a large terminal for readability):
 
 ```sh
-asciinema rec -c "./bin/tmux-ssh-manager --tui-source yaml --config ./docs/demos/hosts.demo.yaml" docs/demos/basic-flow.cast
-asciinema rec -c "./bin/tmux-ssh-manager --tui-source yaml --config ./docs/demos/hosts.demo.yaml" docs/demos/favorites-filter.cast
+go build -o ./bin/tmux-ssh-manager ./cmd/tmux-ssh-manager
+
+vhs docs/demos/basic-flow.tape --output docs/demos/basic-flow.gif
+vhs docs/demos/favorites-filter.tape --output docs/demos/favorites-filter.gif
 ```
 
 Notes:
@@ -43,4 +45,4 @@ Notes:
 
 ### VHS (optional)
 
-If you have VHS available, prefer committing `docs/demos/*.tape` and rendered outputs (gif/mp4/webm). For now this repo ships asciinema `.cast` recordings; regenerate them locally (interactive) using the steps above.
+We commit `docs/demos/*.tape` sources and the rendered `docs/demos/*.gif` outputs. Re-run the commands above to regenerate the GIFs after changing a tape.
