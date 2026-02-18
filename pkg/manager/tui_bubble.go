@@ -5268,8 +5268,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.quit()
 
 		case "s":
-			// If there are multi-selected hosts, split and connect each of them (stacked).
-			// Otherwise, operate on the current host.
+			// Batch stacked splits.
+			//
+			// Problem: sequentially splitting the *current* window can hit tmux pane min-size
+			// constraints early (often around ~4 panes depending on terminal size/status),
+			// which makes batch 's' appear capped.
+			//
+			// Fix: create a dedicated tmux window for the first target (like the 't' path),
+			// then add remaining targets as splits in that window.
 			targets := m.selectedResolved()
 			if len(targets) == 0 {
 				if sel := m.current(); sel != nil {
@@ -5280,12 +5286,99 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
-			failed := 0
-			for _, r := range targets {
+			// For a single target, just do a single stacked split (existing behavior).
+			if len(targets) == 1 {
+				r := targets[0]
 				if _, err := m.tmuxSplitV(r); err != nil {
-					failed++
-					continue
+					m.setStatus(fmt.Sprintf("split h failed: %v", err), 3500)
+					return m, nil
 				}
+				m.addRecent(r.Host.Name)
+				m.saveState()
+				return m.quit()
+			}
+
+			// Create a dedicated window for the first target; if that fails, fall back to splitting in-place.
+			windowID := ""
+			if wid, err := m.tmuxNewWindow(targets[0]); err == nil {
+				windowID = strings.TrimSpace(wid)
+			} else {
+				// Fallback: create first pane via split in current window.
+				if _, serr := m.tmuxSplitV(targets[0]); serr != nil {
+					m.setStatus(fmt.Sprintf("split h: first pane failed: %v", serr), 3500)
+					return m, nil
+				}
+			}
+			m.addRecent(targets[0].Host.Name)
+
+			failed := 0
+			for i := 1; i < len(targets); i++ {
+				r := targets[i]
+
+				if windowID != "" {
+					// Inline split targeting the dedicated window so we don't accidentally split another window.
+					line := ""
+					if strings.EqualFold(strings.TrimSpace(m.effectiveLoginMode(r)), "askpass") {
+						bin := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_BIN"))
+						if bin == "" {
+							bin = "tmux-ssh-manager"
+						}
+						userFlag := ""
+						if strings.TrimSpace(r.EffectiveUser) != "" {
+							userFlag = " --user " + shellEscapeForSh(strings.TrimSpace(r.EffectiveUser))
+						}
+						line = shellEscapeForSh(bin) + " __connect --host " + shellEscapeForSh(strings.TrimSpace(r.Host.Name)) + userFlag
+					} else {
+						argv := BuildSSHCommand(r)
+						line = "command " + shellQuoteCmdSimple(argv)
+					}
+
+					_ = runLocalHooks(r.EffectivePreConnect)
+
+					keepOpenLine := "set +e\n" +
+						"eval " + shellEscapeForSh(line) + "\n" +
+						"rc=$?\n" +
+						"if [ $rc -ne 0 ]; then\n" +
+						"  echo\n" +
+						"  echo 'tmux-ssh-manager: connect FAILED (exit='$rc')'\n" +
+						"  echo\n" +
+						"  echo 'Press Enter to close...'\n" +
+						"  read -r _\n" +
+						"fi\n" +
+						"exit $rc\n"
+
+					cmd := exec.Command("tmux", "split-window", "-t", windowID, "-v", "-P", "-F", "#{pane_id}", "-c", "#{pane_current_path}", "bash", "-lc", keepOpenLine)
+					out, err := cmd.Output()
+					if err != nil {
+						failed++
+						continue
+					}
+					paneID := strings.TrimSpace(string(out))
+					if paneID != "" {
+						m.createdPaneIDs = append(m.createdPaneIDs, paneID)
+						if m.paneHost == nil {
+							m.paneHost = make(map[string]string)
+						}
+						m.paneHost[paneID] = strings.TrimSpace(r.Host.Name)
+						_ = enableTmuxPipePaneLoggingForTarget(paneID, r.Host.Name)
+
+						delayMS := r.EffectiveConnectDelayMS
+						if delayMS <= 0 {
+							delayMS = 500
+						}
+						time.Sleep(time.Duration(delayMS) * time.Millisecond)
+
+						m.sendRecorded(r.Host.Name, paneID, r.EffectiveOnConnect)
+						_ = runLocalHooks(r.EffectivePostConnect)
+					}
+				} else {
+					// No dedicated window: fall back to existing helper (splits current window).
+					if _, err := m.tmuxSplitV(r); err != nil {
+						failed++
+						continue
+					}
+				}
+
 				m.addRecent(r.Host.Name)
 			}
 
@@ -5293,7 +5386,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Enable with: TMUX_SSH_MANAGER_TILED_AFTER_BATCH_SPLIT=1
 			if len(targets) > 1 && strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_TILED_AFTER_BATCH_SPLIT")) != "" &&
 				os.Getenv("TMUX_SSH_MANAGER_TILED_AFTER_BATCH_SPLIT") != "0" {
-				_ = exec.Command("tmux", "select-layout", "tiled").Run()
+				if windowID != "" {
+					_ = exec.Command("tmux", "select-layout", "-t", windowID, "tiled").Run()
+				} else {
+					_ = exec.Command("tmux", "select-layout", "tiled").Run()
+				}
 			}
 
 			if failed > 0 {
