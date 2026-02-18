@@ -916,6 +916,7 @@ The selector runs on Bubble Tea and is tuned for tmux + vim muscle memory. It no
   - W: open a new tmux window for ALL selected hosts (batch)
   - y: yank the ssh command of the selected host to tmux buffer
   - Y: yank ssh commands for ALL selected hosts (batch), one per line
+  - ctrl+a: select all (respects current filter/search)
 - Favorites and recents:
   - Space: toggle multi-select for the current row (for batch actions)
   - f: toggle favorite on the current host
@@ -957,6 +958,7 @@ The interactive selector is built on Bubble Tea and designed to feel natural for
   - t: tiled multi-pane (open selected hosts into panes, then tmux select-layout tiled)
   - w: open a new tmux window and connect (tmux new-window)
   - y: yank the ssh command to the tmux buffer (works well with tmux-yank)
+  - ctrl+a: select all (respects current filter/search)
 - Help and quit:
   - ?: toggle a help overlay
   - q or Esc: quit

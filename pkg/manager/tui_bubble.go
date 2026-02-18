@@ -2983,7 +2983,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						"Navigation: j/k move • gg/G top/bot • u/d half-page • H/L group • n/N next/prev match\n"+
 							"Search: / forward • ? backward • type to search • Esc blur • :search <q>\n"+
 							"Connect: Enter/c connect • v split • s split • t tiled • w window • W windows (all selected)\n"+
-							"Selection: Space toggle-select • f favorite • F favorites • R recents • A all\n"+
+							"Selection: Space toggle-select • ctrl+a select-all (filtered) • f favorite • F favorites • R recents • A all\n"+
 							"Dashboards: B browser • :dash [name] • l layout override (in dashboards)\n"+
 							"Network: N view • :net • :network\n"+
 							"Commands: :send <cmd> • :sendall <cmd> • :watch [interval_s] <cmd> • :watchall [interval_s] <cmd>\n"+
@@ -4567,6 +4567,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.saveState()
 				return m.quit()
 
+			case "ctrl+a":
+				// Quick select-all in insert-mode:
+				// - If the search query is non-empty, select all currently filtered matches.
+				// - If the search query is empty, select all hosts.
+				//
+				// We keep insert-mode focused so you can immediately type to refine, then hit Enter/v/s/t/w.
+				if len(m.filtered) == 0 {
+					m.setStatus("Selected: 0", 1200)
+					return m, nil
+				}
+				for i := range m.filtered {
+					k := hostKeyFromCandidate(&m.filtered[i])
+					if k == "" {
+						continue
+					}
+					m.selectedSet[k] = struct{}{}
+				}
+				if strings.TrimSpace(m.input.Value()) != "" {
+					m.setStatus(fmt.Sprintf("Selected: %d (filtered)", m.selectedCount()), 1200)
+				} else {
+					m.setStatus(fmt.Sprintf("Selected: %d", m.selectedCount()), 1200)
+				}
+				return m, nil
+
 			case "esc":
 				// Explicitly exit insert-mode -> Normal-mode (vim mental model).
 				// In Normal-mode, j/k/n/q/... work as motions/actions.
@@ -5013,6 +5037,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case " ":
 			// toggle multi-select for current row
 			m.toggleCurrentSelection()
+			return m, nil
+		case "ctrl+a":
+			// Quick select-all in normal-mode:
+			// - If a search query is active, select all currently filtered matches.
+			// - Otherwise, select all hosts (filtered is the full list in that case).
+			if len(m.filtered) == 0 {
+				m.setStatus("Selected: 0", 1200)
+				return m, nil
+			}
+			for i := range m.filtered {
+				k := hostKeyFromCandidate(&m.filtered[i])
+				if k == "" {
+					continue
+				}
+				m.selectedSet[k] = struct{}{}
+			}
+			if strings.TrimSpace(m.input.Value()) != "" {
+				m.setStatus(fmt.Sprintf("Selected: %d (filtered)", m.selectedCount()), 1200)
+			} else {
+				m.setStatus(fmt.Sprintf("Selected: %d", m.selectedCount()), 1200)
+			}
 			return m, nil
 		case "f":
 			// toggle favorite on current host
