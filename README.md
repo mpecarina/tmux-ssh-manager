@@ -911,6 +911,7 @@ The selector runs on Bubble Tea and is tuned for tmux + vim muscle memory. It no
   - Enter or c: connect in the current pane
   - v: vertical split (tmux split-window -h) and connect
   - s: horizontal split (tmux split-window -v) and connect
+  - t: tiled multi-pane (open selected hosts into panes, then tmux select-layout tiled)
   - w: new tmux window and connect
   - W: open a new tmux window for ALL selected hosts (batch)
   - y: yank the ssh command of the selected host to tmux buffer
@@ -953,6 +954,7 @@ The interactive selector is built on Bubble Tea and designed to feel natural for
   - Enter or c: connect in the current pane
   - v: split vertically (side-by-side) and connect (tmux split-window -h)
   - s: split horizontally (stacked) and connect (tmux split-window -v)
+  - t: tiled multi-pane (open selected hosts into panes, then tmux select-layout tiled)
   - w: open a new tmux window and connect (tmux new-window)
   - y: yank the ssh command to the tmux buffer (works well with tmux-yank)
 - Help and quit:

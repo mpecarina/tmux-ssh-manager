@@ -2982,7 +2982,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.setStatus(
 						"Navigation: j/k move • gg/G top/bot • u/d half-page • H/L group • n/N next/prev match\n"+
 							"Search: / forward • ? backward • type to search • Esc blur • :search <q>\n"+
-							"Connect: Enter/c connect • v split • s split • w window • W windows (all selected)\n"+
+							"Connect: Enter/c connect • v split • s split • t tiled • w window • W windows (all selected)\n"+
 							"Selection: Space toggle-select • f favorite • F favorites • R recents • A all\n"+
 							"Dashboards: B browser • :dash [name] • l layout override (in dashboards)\n"+
 							"Network: N view • :net • :network\n"+
@@ -5075,6 +5075,56 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				os.Getenv("TMUX_SSH_MANAGER_TILED_AFTER_BATCH_SPLIT") != "0" {
 				_ = exec.Command("tmux", "select-layout", "tiled").Run()
 			}
+
+			if failed > 0 {
+				m.setStatus(fmt.Sprintf("Opened %d, %d failed", len(targets)-failed, failed), 2500)
+			}
+			m.saveState()
+			return m.quit()
+
+		case "t":
+			// Multi-host tiled layout:
+			// - Open all selected hosts as panes (like v/s), then force `select-layout tiled`.
+			// - If only one target is selected, behave like connect-in-new-window (Enter/c).
+			//
+			// Note: requires tmux.
+			if strings.TrimSpace(os.Getenv("TMUX")) == "" {
+				m.setStatus("tiled: requires tmux", 2500)
+				return m, nil
+			}
+
+			targets := m.selectedResolved()
+			if len(targets) == 0 {
+				if sel := m.current(); sel != nil {
+					targets = []ResolvedHost{sel.Resolved}
+				}
+			}
+			if len(targets) == 0 {
+				return m, nil
+			}
+
+			// For a single target, mirror Enter/c behavior (new window connect, with split fallback).
+			if len(targets) == 1 {
+				r := targets[0]
+				if _, err := m.tmuxNewWindow(r); err != nil {
+					_, _ = m.tmuxSplitV(r)
+				}
+				m.addRecent(r.Host.Name)
+				m.saveState()
+				return m.quit()
+			}
+
+			failed := 0
+			for _, r := range targets {
+				// Use vertical splits (stacked) for deterministic creation, then tile.
+				if _, err := m.tmuxSplitV(r); err != nil {
+					failed++
+					continue
+				}
+				m.addRecent(r.Host.Name)
+			}
+
+			_ = exec.Command("tmux", "select-layout", "tiled").Run()
 
 			if failed > 0 {
 				m.setStatus(fmt.Sprintf("Opened %d, %d failed", len(targets)-failed, failed), 2500)
