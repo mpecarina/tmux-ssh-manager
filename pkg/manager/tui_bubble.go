@@ -5165,8 +5165,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			// Create a dedicated window for the first target; if that fails, fall back to splitting in-place.
+			//
+			// IMPORTANT: this is a single-window multi-pane workflow, so we keep the window name generic
+			// (do NOT name it after the first host).
 			windowID := ""
-			if wid, err := m.tmuxNewWindow(targets[0]); err == nil {
+			if wid, err := m.tmuxNewWindowNamed("tmux-ssh-manager", targets[0]); err == nil {
 				windowID = strings.TrimSpace(wid)
 			} else {
 				// Fallback: create first pane via split in current window.
@@ -5301,8 +5304,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			// Create a dedicated window for the first target; if that fails, fall back to splitting in-place.
+			//
+			// IMPORTANT: this is a single-window multi-pane workflow, so we keep the window name generic
+			// (do NOT name it after the first host).
 			windowID := ""
-			if wid, err := m.tmuxNewWindow(targets[0]); err == nil {
+			if wid, err := m.tmuxNewWindowNamed("tmux-ssh-manager", targets[0]); err == nil {
 				windowID = strings.TrimSpace(wid)
 			} else {
 				// Fallback: create first pane via split in current window.
@@ -8177,7 +8183,7 @@ func (m *model) tmuxSplitV(r ResolvedHost) (string, error) {
 	return id, nil
 }
 
-func (m *model) tmuxNewWindow(r ResolvedHost) (string, error) {
+func (m *model) tmuxNewWindowNamed(name string, r ResolvedHost) (string, error) {
 	// Build launch line.
 	//
 	// IMPORTANT:
@@ -8220,12 +8226,12 @@ func (m *model) tmuxNewWindow(r ResolvedHost) (string, error) {
 		"  read -r _\n" +
 		"fi\n" +
 		"exit $rc\n"
-	// Name the window after the target host so the tmux status bar shows the destination,
-	// rather than the foreground process (often "bash" due to our launch wrapper).
-	winName := strings.TrimSpace(r.Host.Name)
+
+	winName := strings.TrimSpace(name)
 	if winName == "" {
 		winName = "ssh"
 	}
+
 	cmd := exec.Command("tmux", "new-window", "-P", "-F", "#{window_id}", "-n", winName, "-c", "#{pane_current_path}", "bash", "-lc", keepOpenLine)
 	out, err := cmd.Output()
 	if err != nil {
@@ -8271,7 +8277,19 @@ func (m *model) tmuxNewWindow(r ResolvedHost) (string, error) {
 	// Run post-connect local hooks (best-effort: ssh may still be negotiating)
 	_ = runLocalHooks(r.EffectivePostConnect)
 
-	return paneID, nil
+	return id, nil
+}
+
+func (m *model) tmuxNewWindow(r ResolvedHost) (string, error) {
+	// Per-host window naming:
+	// This is ONLY desired when we are intentionally creating a dedicated window per host
+	// (e.g. batch window mode). For split/tiled workflows, callers should use
+	// tmuxNewWindowNamed("tmux-ssh-manager", r) for the first window.
+	winName := strings.TrimSpace(r.Host.Name)
+	if winName == "" {
+		winName = "ssh"
+	}
+	return m.tmuxNewWindowNamed(winName, r)
 }
 
 // effectiveLoginMode resolves the effective login mode for a host.
