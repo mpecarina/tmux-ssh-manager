@@ -5128,9 +5128,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.quit()
 
 		case "t":
-			// Multi-host tiled layout:
-			// - Open all selected hosts as panes (like v/s), then force `select-layout tiled`.
-			// - If only one target is selected, behave like connect-in-new-window (Enter/c).
+			// Multi-host tiled layout (more reliable than naive sequential splits):
+			// - Create a dedicated tmux window for the first target (so we don't depend on current pane size/state).
+			// - Add remaining targets as splits in that window.
+			// - Re-apply `select-layout tiled` after each split so tmux continuously rebalances as panes are added.
+			//
+			// If only one target is selected, behave like connect-in-new-window (Enter/c).
 			//
 			// Note: requires tmux.
 			if strings.TrimSpace(os.Getenv("TMUX")) == "" {
@@ -5159,17 +5162,104 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.quit()
 			}
 
-			failed := 0
-			for _, r := range targets {
-				// Use vertical splits (stacked) for deterministic creation, then tile.
-				if _, err := m.tmuxSplitV(r); err != nil {
-					failed++
-					continue
+			// Create a dedicated window for the first target; if that fails, fall back to splitting in-place.
+			windowID := ""
+			if wid, err := m.tmuxNewWindow(targets[0]); err == nil {
+				windowID = strings.TrimSpace(wid)
+			} else {
+				// Fallback: create first pane via split in current window.
+				if _, serr := m.tmuxSplitV(targets[0]); serr != nil {
+					m.setStatus(fmt.Sprintf("tiled: first pane failed: %v", serr), 3500)
+					return m, nil
 				}
+			}
+			m.addRecent(targets[0].Host.Name)
+
+			failed := 0
+			for i := 1; i < len(targets); i++ {
+				r := targets[i]
+
+				// If we have a dedicated window, target it explicitly to avoid splitting the wrong window.
+				if windowID != "" {
+					// Minimal inline split with explicit target. We don't need the returned pane id here.
+					line := ""
+					if strings.EqualFold(strings.TrimSpace(m.effectiveLoginMode(r)), "askpass") {
+						bin := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_BIN"))
+						if bin == "" {
+							bin = "tmux-ssh-manager"
+						}
+						userFlag := ""
+						if strings.TrimSpace(r.EffectiveUser) != "" {
+							userFlag = " --user " + shellEscapeForSh(strings.TrimSpace(r.EffectiveUser))
+						}
+						line = shellEscapeForSh(bin) + " __connect --host " + shellEscapeForSh(strings.TrimSpace(r.Host.Name)) + userFlag
+					} else {
+						argv := BuildSSHCommand(r)
+						line = "command " + shellQuoteCmdSimple(argv)
+					}
+
+					_ = runLocalHooks(r.EffectivePreConnect)
+
+					keepOpenLine := "set +e\n" +
+						"eval " + shellEscapeForSh(line) + "\n" +
+						"rc=$?\n" +
+						"if [ $rc -ne 0 ]; then\n" +
+						"  echo\n" +
+						"  echo 'tmux-ssh-manager: connect FAILED (exit='$rc')'\n" +
+						"  echo\n" +
+						"  echo 'Press Enter to close...'\n" +
+						"  read -r _\n" +
+						"fi\n" +
+						"exit $rc\n"
+
+					cmd := exec.Command("tmux", "split-window", "-t", windowID, "-v", "-P", "-F", "#{pane_id}", "-c", "#{pane_current_path}", "bash", "-lc", keepOpenLine)
+					out, err := cmd.Output()
+					if err != nil {
+						failed++
+						continue
+					}
+					paneID := strings.TrimSpace(string(out))
+					if paneID != "" {
+						m.createdPaneIDs = append(m.createdPaneIDs, paneID)
+						if m.paneHost == nil {
+							m.paneHost = make(map[string]string)
+						}
+						m.paneHost[paneID] = strings.TrimSpace(r.Host.Name)
+						_ = enableTmuxPipePaneLoggingForTarget(paneID, r.Host.Name)
+
+						delayMS := r.EffectiveConnectDelayMS
+						if delayMS <= 0 {
+							delayMS = 500
+						}
+						time.Sleep(time.Duration(delayMS) * time.Millisecond)
+
+						m.sendRecorded(r.Host.Name, paneID, r.EffectiveOnConnect)
+						_ = runLocalHooks(r.EffectivePostConnect)
+					}
+				} else {
+					// No dedicated window: fall back to existing helper (splits current window).
+					if _, err := m.tmuxSplitV(r); err != nil {
+						failed++
+						continue
+					}
+				}
+
 				m.addRecent(r.Host.Name)
+
+				// Re-tile after each addition to rebalance continuously.
+				if windowID != "" {
+					_ = exec.Command("tmux", "select-layout", "-t", windowID, "tiled").Run()
+				} else {
+					_ = exec.Command("tmux", "select-layout", "tiled").Run()
+				}
 			}
 
-			_ = exec.Command("tmux", "select-layout", "tiled").Run()
+			// Final tile pass (best-effort).
+			if windowID != "" {
+				_ = exec.Command("tmux", "select-layout", "-t", windowID, "tiled").Run()
+			} else {
+				_ = exec.Command("tmux", "select-layout", "tiled").Run()
+			}
 
 			if failed > 0 {
 				m.setStatus(fmt.Sprintf("Opened %d, %d failed", len(targets)-failed, failed), 2500)
