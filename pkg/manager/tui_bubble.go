@@ -29,7 +29,9 @@ func RunTUI(cfg *Config, opts UIOptions) error {
 	}
 
 	if os.Getenv("TMUX_SSH_MANAGER_IN_POPUP") != "" {
-		_ = os.Setenv("TERM", "xterm-256color")
+		// In popup mode, never exec-replace the manager process (the popup wrapper expects us to exit normally).
+		// Do NOT force TERM here; the wrapper/terminal should control it, and overriding it can trigger
+		// terminal integration issues in some environments.
 		opts.ExecReplace = false
 	}
 
@@ -8218,7 +8220,13 @@ func (m *model) tmuxNewWindow(r ResolvedHost) (string, error) {
 		"  read -r _\n" +
 		"fi\n" +
 		"exit $rc\n"
-	cmd := exec.Command("tmux", "new-window", "-P", "-F", "#{window_id}", "-c", "#{pane_current_path}", "bash", "-lc", keepOpenLine)
+	// Name the window after the target host so the tmux status bar shows the destination,
+	// rather than the foreground process (often "bash" due to our launch wrapper).
+	winName := strings.TrimSpace(r.Host.Name)
+	if winName == "" {
+		winName = "ssh"
+	}
+	cmd := exec.Command("tmux", "new-window", "-P", "-F", "#{window_id}", "-n", winName, "-c", "#{pane_current_path}", "bash", "-lc", keepOpenLine)
 	out, err := cmd.Output()
 	if err != nil {
 		return "", err
