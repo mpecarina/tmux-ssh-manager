@@ -542,22 +542,22 @@ func resolveEnterMode() string {
 // the original pane (different from the TUI window). When the user runs the binary
 // directly inside tmux, case 3 gives us the current pane (same pane as the TUI).
 func resolveCallerPaneID() string {
-	// Case 1: read from temp file written by launcher
-	if fp := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_CALLER_PANE_FILE")); fp != "" {
-		if data, err := os.ReadFile(fp); err == nil {
-			id := strings.TrimSpace(string(data))
-			// Clean up the temp file (best-effort)
-			_ = os.Remove(fp)
-			if id != "" {
-				return id
-			}
+	// Case 1: read from tmux server option (set by the launcher script).
+	// This avoids embedding pane IDs (which contain '%') in command strings;
+	// tmux set/show handles the value verbatim.
+	if out, err := exec.Command("tmux", "show", "-gqv", "@tmux_ssh_manager_caller_pane").Output(); err == nil {
+		id := strings.TrimSpace(string(out))
+		if id != "" {
+			// Clean up the server option after reading (best-effort)
+			_ = exec.Command("tmux", "set", "-gu", "@tmux_ssh_manager_caller_pane").Run()
+			return id
 		}
 	}
 	// Case 2: direct env var
 	if id := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_CALLER_PANE")); id != "" {
 		return id
 	}
-	// Case 3: auto-detect from tmux
+	// Case 3: auto-detect from tmux (direct binary launch)
 	return strings.TrimSpace(os.Getenv("TMUX_PANE"))
 }
 

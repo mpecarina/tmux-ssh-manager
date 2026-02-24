@@ -151,12 +151,12 @@ fi
 POPUP_WRAPPER="${REPO_ROOT}/scripts/popup_wrapper.sh"
 
 # Capture the pane that triggered the launch so "pane" mode can send-keys back to it.
-# We write this to a temp file instead of embedding in ENV_PREFIX because pane IDs
-# contain '%' (e.g., %0) which tmux interprets as format specifiers in new-window/display-popup commands.
+# We store this in a tmux server option because pane IDs contain '%' (e.g., %0) which
+# tmux interprets as format specifiers when embedded in new-window/display-popup command strings.
+# tmux set/show handles the value verbatim without interpretation.
 CALLER_PANE="$(tmux display-message -p '#{pane_id}' 2>/dev/null || true)"
-CALLER_PANE_FILE="${TMPDIR:-/tmp}/tmux-ssh-manager-caller-pane.$$"
 if [[ -n "${CALLER_PANE}" ]]; then
-  printf '%s' "${CALLER_PANE}" > "${CALLER_PANE_FILE}"
+  tmux set -g @tmux_ssh_manager_caller_pane "${CALLER_PANE}"
 fi
 
 
@@ -194,10 +194,6 @@ if [[ "${LAUNCH_MODE}" == "window" ]]; then
     ENV_PREFIX+=" TMUX_SSH_MANAGER_ENTER_MODE=$(printf %q "${ENTER_MODE_OPT}")"
   elif [[ -n "${TMUX_SSH_MANAGER_ENTER_MODE-}" ]]; then
     ENV_PREFIX+=" TMUX_SSH_MANAGER_ENTER_MODE=$(printf %q "${TMUX_SSH_MANAGER_ENTER_MODE}")"
-  fi
-
-  if [[ -n "${CALLER_PANE_FILE}" ]] && [[ -f "${CALLER_PANE_FILE}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_CALLER_PANE_FILE=$(printf %q "${CALLER_PANE_FILE}")"
   fi
 
   if ! tmux new-window -n "ssh-manager" -c "#{pane_current_path}" -- bash -lc "${ENV_PREFIX} ${CMD_STR}"; then
@@ -247,10 +243,6 @@ if [[ "${supports_popup}" == true ]]; then
     ENV_PREFIX+=" TMUX_SSH_MANAGER_ENTER_MODE=$(printf %q "${ENTER_MODE_OPT}")"
   elif [[ -n "${TMUX_SSH_MANAGER_ENTER_MODE-}" ]]; then
     ENV_PREFIX+=" TMUX_SSH_MANAGER_ENTER_MODE=$(printf %q "${TMUX_SSH_MANAGER_ENTER_MODE}")"
-  fi
-
-  if [[ -n "${CALLER_PANE_FILE}" ]] && [[ -f "${CALLER_PANE_FILE}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_CALLER_PANE_FILE=$(printf %q "${CALLER_PANE_FILE}")"
   fi
 
   if ! tmux display-popup -E -w 90% -h 80% -- bash -lc "${ENV_PREFIX} \"${POPUP_WRAPPER}\" --cmd $(printf %q "${CMD_STR}")"; then
