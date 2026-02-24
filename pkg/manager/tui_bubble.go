@@ -35,11 +35,37 @@ func RunTUI(cfg *Config, opts UIOptions) error {
 		opts.ExecReplace = false
 	}
 
+	// Reset any stale deferred pane command from a previous run (safety).
+	pendingPaneCmd = nil
+
 	m := newModel(cfg, opts)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := p.Run()
+
+	// After the TUI exits, check if there is a deferred send-keys command.
+	// This is used when the TUI and the caller share the same tmux pane
+	// (direct binary launch without the tmux-prefix launcher).
+	if pending := pendingPaneCmd; pending != nil {
+		pendingPaneCmd = nil
+		cmd := exec.Command("tmux", "send-keys", "-t", pending.PaneID, pending.Line, "Enter")
+		if serr := cmd.Run(); serr != nil && err == nil {
+			err = fmt.Errorf("deferred send-keys to %s: %w", pending.PaneID, serr)
+		}
+	}
+
 	return err
 }
+
+// pendingPaneAction stores a deferred tmux send-keys command to execute
+// after the Bubble Tea program exits. This is needed when the TUI runs in
+// the same tmux pane as the caller (direct binary launch without the
+// tmux-prefix launcher).
+type pendingPaneAction struct {
+	PaneID string
+	Line   string
+}
+
+var pendingPaneCmd *pendingPaneAction
 
 type netNode struct {
 	ID            string
@@ -250,8 +276,12 @@ type model struct {
 	createdWindowIDs []string
 
 	// Enter key behavior mode (configurable via TMUX_SSH_MANAGER_ENTER_MODE or @tmux_ssh_manager_enter_mode).
-	// Values: "w" (new window, default), "p" (existing pane), "s" (horizontal/stacked split), "v" (vertical/side-by-side split).
+	// Values: "p" (existing pane, default), "w" (new window), "s" (horizontal/stacked split), "v" (vertical/side-by-side split).
 	enterMode string
+
+	// callerPaneID is the tmux pane that was active when the launcher opened the TUI window/popup.
+	// Used by "pane" mode to send-keys back to the original pane instead of opening a new window.
+	callerPaneID string
 
 	// persistence
 	statePath string
@@ -443,6 +473,9 @@ func newModel(cfg *Config, opts UIOptions) model {
 
 		// Enter key behavior (default: "w" for new window)
 		enterMode: resolveEnterMode(),
+
+		// Caller pane (set by launcher; used for "pane" mode send-keys)
+		callerPaneID: resolveCallerPaneID(),
 	}
 	// Load persistent favorites/recents state
 	if path, err := DefaultStatePath(); err == nil {
@@ -479,8 +512,8 @@ func newModel(cfg *Config, opts UIOptions) model {
 }
 
 // resolveEnterMode reads TMUX_SSH_MANAGER_ENTER_MODE and normalizes it.
-// Valid values: "w" (new window), "p" (existing pane), "s" (stacked split), "v" (side-by-side split).
-// Default: "w".
+// Valid values: "p" (existing pane, default), "w" (new window), "s" (stacked split), "v" (side-by-side split).
+// Default: "p".
 func resolveEnterMode() string {
 	raw := strings.ToLower(strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_ENTER_MODE")))
 	switch raw {
@@ -490,24 +523,65 @@ func resolveEnterMode() string {
 		return "s"
 	case "v", "split-v":
 		return "v"
-	case "w", "window", "":
+	case "w", "window":
 		return "w"
 	default:
-		return "w"
+		return "p"
 	}
+}
+
+// resolveCallerPaneID determines the caller pane ID.
+// Priority:
+//  1. TMUX_SSH_MANAGER_CALLER_PANE_FILE — a temp file written by the launcher script containing the pane ID.
+//     We read from a file because pane IDs contain '%' (e.g., %0) which tmux interprets as format
+//     specifiers when embedded in tmux new-window / display-popup command strings.
+//  2. TMUX_SSH_MANAGER_CALLER_PANE — direct env var (e.g., set manually or by tests).
+//  3. TMUX_PANE — auto-detected; the pane the binary was launched in directly.
+//
+// When the TUI was launched via the prefix keybinding (launcher), case 1 gives us
+// the original pane (different from the TUI window). When the user runs the binary
+// directly inside tmux, case 3 gives us the current pane (same pane as the TUI).
+func resolveCallerPaneID() string {
+	// Case 1: read from temp file written by launcher
+	if fp := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_CALLER_PANE_FILE")); fp != "" {
+		if data, err := os.ReadFile(fp); err == nil {
+			id := strings.TrimSpace(string(data))
+			// Clean up the temp file (best-effort)
+			_ = os.Remove(fp)
+			if id != "" {
+				return id
+			}
+		}
+	}
+	// Case 2: direct env var
+	if id := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_CALLER_PANE")); id != "" {
+		return id
+	}
+	// Case 3: auto-detect from tmux
+	return strings.TrimSpace(os.Getenv("TMUX_PANE"))
+}
+
+// callerPaneIsSelf returns true when the caller pane is the same pane the TUI
+// is running in. This happens when the user launches the binary directly (not
+// via the tmux-prefix keybinding launcher which opens a separate window/popup).
+func (m model) callerPaneIsSelf() bool {
+	if m.callerPaneID == "" {
+		return false
+	}
+	return m.callerPaneID == strings.TrimSpace(os.Getenv("TMUX_PANE"))
 }
 
 // enterModeLabel returns a short human-readable label for the current Enter mode.
 func (m model) enterModeLabel() string {
 	switch m.enterMode {
-	case "p":
-		return "pane"
 	case "s":
 		return "split-h"
 	case "v":
 		return "split-v"
-	default:
+	case "w":
 		return "window"
+	default:
+		return "pane"
 	}
 }
 
@@ -519,7 +593,7 @@ func (m model) enterActionSingle(r ResolvedHost) (tea.Model, tea.Cmd) {
 
 	switch m.enterMode {
 	case "p":
-		return m.connectOrQuit(r)
+		return m.connectToCallerPaneOrQuit(r)
 
 	case "s":
 		if strings.TrimSpace(os.Getenv("TMUX")) == "" {
@@ -1063,7 +1137,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "p":
 				// Always connect in existing pane, regardless of enter mode.
 				if n := m.netFocusedNode(); n != nil && n.Configured && n.Resolved != nil {
-					return m.connectOrQuit(*n.Resolved)
+					return m.connectToCallerPaneOrQuit(*n.Resolved)
 				}
 				m.setStatus("network: selected node is not a configured host", 2500)
 				return m, nil
@@ -4166,7 +4240,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					r := targets[0]
 					m.addRecent(r.Host.Name)
 					m.saveState()
-					return m.connectOrQuit(r)
+					return m.connectToCallerPaneOrQuit(r)
 
 				case "window", "w":
 					// Alias to "connect in new window(s)"
@@ -4752,7 +4826,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			idx, _ := strconv.Atoi(m.numBuf)
 			m.numBuf = ""
 			if idx >= 1 && idx <= len(m.filtered) {
-				return m.connectOrQuit(m.filtered[idx-1].Resolved)
+				return m.connectToCallerPaneOrQuit(m.filtered[idx-1].Resolved)
 			}
 			m.setStatus("Invalid index", 1200)
 			return m, nil
@@ -4876,11 +4950,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m.enterActionMulti(targets)
 		case "p":
-			// Always connect in the existing pane (inline connect), regardless of enter mode.
+			// Always connect in the existing pane (caller's pane), regardless of enter mode.
 			if sel := m.current(); sel != nil {
-				m.addRecent(sel.Resolved.Host.Name)
-				m.saveState()
-				return m.connectOrQuit(sel.Resolved)
+				return m.connectToCallerPaneOrQuit(sel.Resolved)
 			}
 			return m, nil
 		case "c":
@@ -8147,6 +8219,22 @@ func (m model) quit() (tea.Model, tea.Cmd) {
 	return m2, tea.Quit
 }
 
+// connectToCallerPaneOrQuit sends the SSH command to the caller's original pane when inside tmux
+// and callerPaneID is available. Falls back to connectOrQuit (inline exec) otherwise.
+func (m model) connectToCallerPaneOrQuit(r ResolvedHost) (tea.Model, tea.Cmd) {
+	if strings.TrimSpace(os.Getenv("TMUX")) != "" && m.callerPaneID != "" {
+		m.addRecent(r.Host.Name)
+		m.saveState()
+		if err := m.tmuxSendToCallerPane(r); err != nil {
+			m2 := m
+			m2.setStatus(fmt.Sprintf("pane send failed: %v", err), 3500)
+			return m2, nil
+		}
+		return m.quit()
+	}
+	return m.connectOrQuit(r)
+}
+
 func (m model) connectOrQuit(r ResolvedHost) (tea.Model, tea.Cmd) {
 	// Pre-connect local hooks
 	_ = runLocalHooks(r.EffectivePreConnect)
@@ -8167,6 +8255,67 @@ func (m model) connectOrQuit(r ResolvedHost) (tea.Model, tea.Cmd) {
 	m2.addRecent(r.Host.Name)
 	m2.saveState()
 	return m2.quit()
+}
+
+// tmuxSendToCallerPane sends the SSH command to the pane that launched the TUI
+// (identified by m.callerPaneID) using `tmux send-keys`. This allows "pane" mode
+// to run SSH in the user's original shell instead of opening a new window/split.
+//
+// When the caller pane is the SAME pane as the TUI (direct binary launch without
+// the tmux-prefix launcher), we can't send-keys immediately because the TUI still
+// owns the terminal (alt-screen, raw mode). In that case, the send-keys is deferred
+// via pendingPaneCmd and executed by RunTUI after p.Run() returns.
+func (m *model) tmuxSendToCallerPane(r ResolvedHost) error {
+	if m.callerPaneID == "" {
+		return fmt.Errorf("caller pane ID not set (TMUX_SSH_MANAGER_CALLER_PANE / TMUX_PANE)")
+	}
+
+	// Build the ssh command line.
+	// IMPORTANT: Always use the direct `command ssh ...` form for pane mode.
+	// The internal PTY connector (__connect / askpass) creates its own pseudo-terminal,
+	// which cannot read interactive input (passwords) from the caller pane's TTY when
+	// launched via `tmux send-keys`. The caller pane already has an interactive terminal,
+	// so the standard OpenSSH client handles password/passphrase prompts natively.
+	argv := BuildSSHCommand(r)
+	line := "command " + shellQuoteCmdSimple(argv)
+
+	// Run pre-connect local hooks
+	_ = runLocalHooks(r.EffectivePreConnect)
+
+	if m.callerPaneIsSelf() {
+		// Same pane: defer the send-keys until after the TUI exits.
+		// RunTUI will pick this up and execute it after p.Run() returns.
+		pendingPaneCmd = &pendingPaneAction{
+			PaneID: m.callerPaneID,
+			Line:   line,
+		}
+	} else {
+		// Different pane (launched via tmux-prefix keybinding): send immediately.
+		cmd := exec.Command("tmux", "send-keys", "-t", m.callerPaneID, line, "Enter")
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("send-keys to %s: %w", m.callerPaneID, err)
+		}
+	}
+
+	// Track pane->host mapping for :send/:dash save.
+	if m.paneHost == nil {
+		m.paneHost = make(map[string]string)
+	}
+	m.paneHost[m.callerPaneID] = strings.TrimSpace(r.Host.Name)
+
+	// Enable per-host daily logging for the caller pane.
+	_ = enableTmuxPipePaneLoggingForTarget(m.callerPaneID, r.Host.Name)
+
+	// NOTE: We intentionally do NOT send on_connect commands here.
+	// The caller pane is interactive — the SSH session may prompt for a password
+	// or passphrase, and sending commands via send-keys would interfere.
+	// on_connect commands are only sent for split/window modes where we control
+	// the pane lifecycle.
+
+	// Run post-connect local hooks
+	_ = runLocalHooks(r.EffectivePostConnect)
+
+	return nil
 }
 
 func (m *model) tmuxSplitH(r ResolvedHost) (string, error) {

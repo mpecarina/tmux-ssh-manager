@@ -1100,12 +1100,12 @@ set -g @tmux_ssh_manager_launch_mode 'window'
 set -g @tmux_ssh_manager_picker 'tui'
 
 # Optional: configure what the Enter key does in the host list
-# - w (default): open a new tmux window and connect
-# - p: connect in the existing pane (inline)
+# - p (default): connect in the existing pane (send command to caller's pane)
+# - w: open a new tmux window and connect
 # - s: split horizontally (stacked) and connect
 # - v: split vertically (side-by-side) and connect
 # The dedicated keys (p, s, v, w) always work regardless of this setting.
-set -g @tmux_ssh_manager_enter_mode 'w'
+set -g @tmux_ssh_manager_enter_mode 'p'
 
 # TPM init (keep at bottom)
 run '~/.tmux/plugins/tpm/tpm'
