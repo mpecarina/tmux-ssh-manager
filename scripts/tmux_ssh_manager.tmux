@@ -53,8 +53,27 @@ fi
 
 
 
+# ---------------------------------------------------------------------------
+# Auto-build / rebuild logic
+# ---------------------------------------------------------------------------
 DEFAULT_BIN_PATH="${REPO_ROOT}/bin/tmux-ssh-manager"
+NEED_BUILD=0
+
 if [[ ! -x "${BIN_PATH}" ]]; then
+  # Binary doesn't exist at all — need to build.
+  NEED_BUILD=1
+elif [[ "${BIN_PATH}" == "${DEFAULT_BIN_PATH}" ]]; then
+  # Binary exists and uses the repo-local path — check commit freshness.
+  # git rev-parse HEAD gives the current repo commit; the binary reports
+  # the commit it was built with via --build-commit (stamped by -ldflags).
+  REPO_COMMIT="$(cd "${REPO_ROOT}" && git rev-parse HEAD 2>/dev/null || true)"
+  BIN_COMMIT="$("${BIN_PATH}" --build-commit 2>/dev/null || true)"
+  if [[ -n "${REPO_COMMIT}" ]] && [[ "${BIN_COMMIT}" != "${REPO_COMMIT}" ]]; then
+    NEED_BUILD=1
+  fi
+fi
+
+if (( NEED_BUILD )); then
   # Only auto-build when using the default (repo-local) binary location.
   # If the user set @tmux_ssh_manager_bin, don't build into arbitrary paths.
   if [[ "${BIN_PATH}" == "${DEFAULT_BIN_PATH}" ]]; then
@@ -64,11 +83,24 @@ if [[ ! -x "${BIN_PATH}" ]]; then
       exit 1
     fi
 
+    REPO_COMMIT="${REPO_COMMIT:-$(cd "${REPO_ROOT}" && git rev-parse HEAD 2>/dev/null || true)}"
+    LDFLAGS=""
+    if [[ -n "${REPO_COMMIT}" ]]; then
+      LDFLAGS="-ldflags=-X main.BuildCommit=${REPO_COMMIT}"
+    fi
+
     mkdir -p "${REPO_ROOT}/bin" 2>/dev/null || true
     tmux display-message -d 2000 "tmux-ssh-manager: building Go binary..."
-    if ! (cd "${REPO_ROOT}" && go build -o "bin/tmux-ssh-manager" "./cmd/tmux-ssh-manager"); then
-      tmux display-message -d 8000 "tmux-ssh-manager: build failed. Try: (cd ${REPO_ROOT} && go build -o bin/tmux-ssh-manager ./cmd/tmux-ssh-manager)"
-      exit 1
+    if [[ -n "${LDFLAGS}" ]]; then
+      if ! (cd "${REPO_ROOT}" && go build ${LDFLAGS} -o "bin/tmux-ssh-manager" "./cmd/tmux-ssh-manager"); then
+        tmux display-message -d 8000 "tmux-ssh-manager: build failed. Try: (cd ${REPO_ROOT} && go build -o bin/tmux-ssh-manager ./cmd/tmux-ssh-manager)"
+        exit 1
+      fi
+    else
+      if ! (cd "${REPO_ROOT}" && go build -o "bin/tmux-ssh-manager" "./cmd/tmux-ssh-manager"); then
+        tmux display-message -d 8000 "tmux-ssh-manager: build failed. Try: (cd ${REPO_ROOT} && go build -o bin/tmux-ssh-manager ./cmd/tmux-ssh-manager)"
+        exit 1
+      fi
     fi
   fi
 

@@ -21,6 +21,13 @@ import (
 	"tmux-ssh-manager/pkg/manager"
 )
 
+// BuildCommit is stamped at build time via:
+//
+//	go build -ldflags "-X main.BuildCommit=$(git rev-parse HEAD)" ...
+//
+// When empty the binary was built without commit tracking.
+var BuildCommit string
+
 var (
 	flagConfig       string
 	flagHost         string
@@ -28,6 +35,7 @@ var (
 	flagList         bool
 	flagInitialQuery string
 	flagMaxResults   int
+	flagBuildCommit  bool
 	flagPrintConfig  bool
 	flagDryRun       bool
 
@@ -72,6 +80,8 @@ func init() {
 	flag.BoolVar(&flagFZFPrint, "fzf-print", false, "With --fzf: print selected host key(s) and exit (no connect).")
 	flag.BoolVar(&flagListFZF, "list-fzf", false, "Print fzf candidates as: <hostKey>\\t<display> (no UI, no connect). Intended for zsh widgets to run fzf safely and then exec/connect.")
 
+	flag.BoolVar(&flagBuildCommit, "build-commit", false, "Print the git commit this binary was built from and exit")
+
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "tmux-ssh-manager\n\n")
 		fmt.Fprintf(os.Stderr, "Usage:\n")
@@ -100,6 +110,15 @@ Deprecated:
 func main() {
 	flag.Parse()
 	sshArgs := flag.Args()
+
+	if flagBuildCommit {
+		if BuildCommit == "" {
+			fmt.Println("unknown")
+		} else {
+			fmt.Println(BuildCommit)
+		}
+		return
+	}
 
 	if flag.NArg() >= 1 {
 		switch flag.Arg(0) {
