@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launcher for tmux-ssh-manager (window by default, popup optional).
+# Launcher for tmux-ssh-manager (popup by default; also supports window and pane).
 set -euo pipefail
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -42,14 +42,15 @@ if [[ "${CONFIG_PATH}" == "~/"* ]]; then
   CONFIG_PATH="${HOME}/${CONFIG_PATH:2}"
 fi
 
-# Default launch mode to "window" for a more native tmux experience.
+# Default launch mode to "popup".
 if [[ -z "${LAUNCH_MODE}" ]]; then
-  LAUNCH_MODE="window"
+  LAUNCH_MODE="popup"
 fi
-# Normalize
-if [[ "${LAUNCH_MODE}" != "popup" ]]; then
-  LAUNCH_MODE="window"
-fi
+# Normalize to one of: popup | window | pane
+case "${LAUNCH_MODE}" in
+  popup|window|pane) ;;
+  *) LAUNCH_MODE="popup" ;;
+esac
 
 
 
@@ -188,6 +189,54 @@ if [[ -n "${CALLER_PANE}" ]]; then
 fi
 
 
+# ---------------------------------------------------------------------------
+# Pane mode: run the TUI directly in the current pane (no new window/popup).
+# ---------------------------------------------------------------------------
+if [[ "${LAUNCH_MODE}" == "pane" ]]; then
+  tmux display-message -d 1500 "tmux-ssh-manager: launching in pane"
+
+  ENV_PREFIX="TERM=xterm-256color TMUX_SSH_MANAGER_BIN=$(printf %q "${BIN_PATH}")"
+
+  if [[ -n "${GPG_SYMMETRIC_OPT}" ]]; then
+    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_SYMMETRIC=$(printf %q "${GPG_SYMMETRIC_OPT}")"
+  elif [[ -n "${TMUX_SSH_MANAGER_GPG_SYMMETRIC-}" ]]; then
+    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_SYMMETRIC=$(printf %q "${TMUX_SSH_MANAGER_GPG_SYMMETRIC}")"
+  fi
+
+  if [[ -n "${GPG_PASSPHRASE_FILE_OPT}" ]]; then
+    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_PASSPHRASE_FILE=$(printf %q "${GPG_PASSPHRASE_FILE_OPT}")"
+  elif [[ -n "${TMUX_SSH_MANAGER_GPG_PASSPHRASE_FILE-}" ]]; then
+    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_PASSPHRASE_FILE=$(printf %q "${TMUX_SSH_MANAGER_GPG_PASSPHRASE_FILE}")"
+  fi
+
+  if [[ -n "${GPG_RECIPIENT_OPT}" ]]; then
+    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_RECIPIENT=$(printf %q "${GPG_RECIPIENT_OPT}")"
+  elif [[ -n "${TMUX_SSH_MANAGER_GPG_RECIPIENT-}" ]]; then
+    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_RECIPIENT=$(printf %q "${TMUX_SSH_MANAGER_GPG_RECIPIENT}")"
+  fi
+
+  if [[ -n "${GPG_BINARY_OPT}" ]]; then
+    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_BINARY=$(printf %q "${GPG_BINARY_OPT}")"
+  elif [[ -n "${TMUX_SSH_MANAGER_GPG_BINARY-}" ]]; then
+    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_BINARY=$(printf %q "${TMUX_SSH_MANAGER_GPG_BINARY}")"
+  fi
+
+  if [[ -n "${ENTER_MODE_OPT}" ]]; then
+    ENV_PREFIX+=" TMUX_SSH_MANAGER_ENTER_MODE=$(printf %q "${ENTER_MODE_OPT}")"
+  elif [[ -n "${TMUX_SSH_MANAGER_ENTER_MODE-}" ]]; then
+    ENV_PREFIX+=" TMUX_SSH_MANAGER_ENTER_MODE=$(printf %q "${TMUX_SSH_MANAGER_ENTER_MODE}")"
+  fi
+
+  # send-keys runs the command in the *current* pane (the caller pane itself).
+  # We use send-keys rather than eval so that tmux manages the process lifetime
+  # and the user's shell history/environment is preserved after the TUI exits.
+  tmux send-keys "${ENV_PREFIX} ${CMD_STR}" Enter
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Window mode
+# ---------------------------------------------------------------------------
 if [[ "${LAUNCH_MODE}" == "window" ]]; then
   tmux display-message -d 1500 "tmux-ssh-manager: launching window"
 
