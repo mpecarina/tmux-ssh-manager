@@ -16,6 +16,7 @@ GPG_SYMMETRIC_OPT="$(tmux show -gqv @tmux_ssh_manager_gpg_symmetric || true)"
 GPG_PASSPHRASE_FILE_OPT="$(tmux show -gqv @tmux_ssh_manager_gpg_passphrase_file || true)"
 GPG_RECIPIENT_OPT="$(tmux show -gqv @tmux_ssh_manager_gpg_recipient || true)"
 GPG_BINARY_OPT="$(tmux show -gqv @tmux_ssh_manager_gpg_binary || true)"
+ENTER_MODE_OPT="$(tmux show -gqv @tmux_ssh_manager_enter_mode || true)"
 
 # Force SSH mode by default for tmux keybinding launches (never require YAML).
 # Users can still override with: set -g @tmux_ssh_manager_tui_source 'yaml'
@@ -180,6 +181,12 @@ if [[ "${LAUNCH_MODE}" == "window" ]]; then
     ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_BINARY=$(printf %q "${TMUX_SSH_MANAGER_GPG_BINARY}")"
   fi
 
+  if [[ -n "${ENTER_MODE_OPT}" ]]; then
+    ENV_PREFIX+=" TMUX_SSH_MANAGER_ENTER_MODE=$(printf %q "${ENTER_MODE_OPT}")"
+  elif [[ -n "${TMUX_SSH_MANAGER_ENTER_MODE-}" ]]; then
+    ENV_PREFIX+=" TMUX_SSH_MANAGER_ENTER_MODE=$(printf %q "${TMUX_SSH_MANAGER_ENTER_MODE}")"
+  fi
+
   if ! tmux new-window -n "ssh-manager" -c "#{pane_current_path}" -- bash -lc "${ENV_PREFIX} ${CMD_STR}"; then
     tmux display-message -d 10000 "tmux-ssh-manager: failed to open window."
     exit 1
@@ -221,6 +228,12 @@ if [[ "${supports_popup}" == true ]]; then
     ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_BINARY=$(printf %q "${GPG_BINARY_OPT}")"
   elif [[ -n "${TMUX_SSH_MANAGER_GPG_BINARY-}" ]]; then
     ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_BINARY=$(printf %q "${TMUX_SSH_MANAGER_GPG_BINARY}")"
+  fi
+
+  if [[ -n "${ENTER_MODE_OPT}" ]]; then
+    ENV_PREFIX+=" TMUX_SSH_MANAGER_ENTER_MODE=$(printf %q "${ENTER_MODE_OPT}")"
+  elif [[ -n "${TMUX_SSH_MANAGER_ENTER_MODE-}" ]]; then
+    ENV_PREFIX+=" TMUX_SSH_MANAGER_ENTER_MODE=$(printf %q "${TMUX_SSH_MANAGER_ENTER_MODE}")"
   fi
 
   if ! tmux display-popup -E -w 90% -h 80% -- bash -lc "${ENV_PREFIX} \"${POPUP_WRAPPER}\" --cmd $(printf %q "${CMD_STR}")"; then

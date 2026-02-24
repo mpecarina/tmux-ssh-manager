@@ -1099,6 +1099,14 @@ set -g @tmux_ssh_manager_launch_mode 'window'
 #   Requires `fzf` to be installed and on PATH for the tmux server environment.
 set -g @tmux_ssh_manager_picker 'tui'
 
+# Optional: configure what the Enter key does in the host list
+# - w (default): open a new tmux window and connect
+# - p: connect in the existing pane (inline)
+# - s: split horizontally (stacked) and connect
+# - v: split vertically (side-by-side) and connect
+# The dedicated keys (p, s, v, w) always work regardless of this setting.
+set -g @tmux_ssh_manager_enter_mode 'w'
+
 # TPM init (keep at bottom)
 run '~/.tmux/plugins/tpm/tpm'
 ```

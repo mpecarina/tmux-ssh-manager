@@ -249,6 +249,10 @@ type model struct {
 	createdPaneIDs   []string
 	createdWindowIDs []string
 
+	// Enter key behavior mode (configurable via TMUX_SSH_MANAGER_ENTER_MODE or @tmux_ssh_manager_enter_mode).
+	// Values: "w" (new window, default), "p" (existing pane), "s" (horizontal/stacked split), "v" (vertical/side-by-side split).
+	enterMode string
+
 	// persistence
 	statePath string
 	state     *State
@@ -436,6 +440,9 @@ func newModel(cfg *Config, opts UIOptions) model {
 
 		// pane mapping defaults
 		paneHost: make(map[string]string),
+
+		// Enter key behavior (default: "w" for new window)
+		enterMode: resolveEnterMode(),
 	}
 	// Load persistent favorites/recents state
 	if path, err := DefaultStatePath(); err == nil {
@@ -469,6 +476,133 @@ func newModel(cfg *Config, opts UIOptions) model {
 
 	m.theme = LoadTheme("")
 	return m
+}
+
+// resolveEnterMode reads TMUX_SSH_MANAGER_ENTER_MODE and normalizes it.
+// Valid values: "w" (new window), "p" (existing pane), "s" (stacked split), "v" (side-by-side split).
+// Default: "w".
+func resolveEnterMode() string {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_ENTER_MODE")))
+	switch raw {
+	case "p", "pane":
+		return "p"
+	case "s", "split", "split-h":
+		return "s"
+	case "v", "split-v":
+		return "v"
+	case "w", "window", "":
+		return "w"
+	default:
+		return "w"
+	}
+}
+
+// enterModeLabel returns a short human-readable label for the current Enter mode.
+func (m model) enterModeLabel() string {
+	switch m.enterMode {
+	case "p":
+		return "pane"
+	case "s":
+		return "split-h"
+	case "v":
+		return "split-v"
+	default:
+		return "window"
+	}
+}
+
+// enterActionSingle dispatches the Enter key based on m.enterMode for a single resolved host.
+// Returns (model, cmd) like other tea.Model handlers.
+func (m model) enterActionSingle(r ResolvedHost) (tea.Model, tea.Cmd) {
+	m.addRecent(r.Host.Name)
+	m.saveState()
+
+	switch m.enterMode {
+	case "p":
+		return m.connectOrQuit(r)
+
+	case "s":
+		if strings.TrimSpace(os.Getenv("TMUX")) == "" {
+			return m.connectOrQuit(r)
+		}
+		if _, err := m.tmuxSplitV(r); err != nil {
+			m.setStatus(fmt.Sprintf("split h failed: %v", err), 3500)
+			return m, nil
+		}
+		return m.quit()
+
+	case "v":
+		if strings.TrimSpace(os.Getenv("TMUX")) == "" {
+			return m.connectOrQuit(r)
+		}
+		if _, err := m.tmuxSplitH(r); err != nil {
+			m.setStatus(fmt.Sprintf("split v failed: %v", err), 3500)
+			return m, nil
+		}
+		return m.quit()
+
+	default: // "w"
+		if strings.TrimSpace(os.Getenv("TMUX")) == "" {
+			return m.connectOrQuit(r)
+		}
+		if _, err := m.tmuxNewWindow(r); err != nil {
+			if _, serr := m.tmuxSplitV(r); serr != nil {
+				m.setStatus(fmt.Sprintf("window failed: %v", err), 3500)
+				return m, nil
+			}
+		}
+		return m.quit()
+	}
+}
+
+// enterActionMulti dispatches the Enter key based on m.enterMode for multiple targets.
+// For "p" mode, only single targets are supported (falls back to first).
+func (m model) enterActionMulti(targets []ResolvedHost) (tea.Model, tea.Cmd) {
+	if len(targets) == 0 {
+		return m, nil
+	}
+
+	// Existing pane only supports single host
+	if m.enterMode == "p" {
+		return m.enterActionSingle(targets[0])
+	}
+
+	// Outside tmux: can only connect to single host inline
+	if strings.TrimSpace(os.Getenv("TMUX")) == "" {
+		if len(targets) != 1 {
+			m.setStatus("Multi-select requires tmux. Start tmux or select a single host.", 3500)
+			return m, nil
+		}
+		m.addRecent(targets[0].Host.Name)
+		m.saveState()
+		return m.connectOrQuit(targets[0])
+	}
+
+	failed := 0
+	for _, r := range targets {
+		var err error
+		switch m.enterMode {
+		case "s":
+			_, err = m.tmuxSplitV(r)
+		case "v":
+			_, err = m.tmuxSplitH(r)
+		default: // "w"
+			if _, werr := m.tmuxNewWindow(r); werr != nil {
+				_, err = m.tmuxSplitV(r)
+			}
+		}
+		if err != nil {
+			failed++
+			continue
+		}
+		m.addRecent(r.Host.Name)
+	}
+
+	if failed > 0 {
+		m.setStatus(fmt.Sprintf("Opened %d, %d failed", len(targets)-failed, failed), 2500)
+	}
+	m.saveState()
+	return m.quit()
 }
 
 func (m model) Init() tea.Cmd {
@@ -918,8 +1052,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.netQuery.Focus()
 				return m, nil
 
-			case "enter", "c":
-				// connect to focused node (only if configured)
+			case "enter":
+				// Dispatch Enter based on configured enter mode.
+				if n := m.netFocusedNode(); n != nil && n.Configured && n.Resolved != nil {
+					return m.enterActionSingle(*n.Resolved)
+				}
+				m.setStatus("network: selected node is not a configured host", 2500)
+				return m, nil
+
+			case "p":
+				// Always connect in existing pane, regardless of enter mode.
+				if n := m.netFocusedNode(); n != nil && n.Configured && n.Resolved != nil {
+					return m.connectOrQuit(*n.Resolved)
+				}
+				m.setStatus("network: selected node is not a configured host", 2500)
+				return m, nil
+
+			case "c":
+				// connect to focused node in new window (only if configured)
 				if n := m.netFocusedNode(); n != nil && n.Configured && n.Resolved != nil {
 					// Reuse existing logic; respect tmux/outside-tmux semantics.
 					if strings.TrimSpace(os.Getenv("TMUX")) == "" {
@@ -2984,7 +3134,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.setStatus(
 						"Navigation: j/k move • gg/G top/bot • u/d half-page • H/L group • n/N next/prev match\n"+
 							"Search: / forward • ? backward • type to search • Esc blur • :search <q>\n"+
-							"Connect: Enter/c connect • v split • s split • t tiled • w window • W windows (all selected)\n"+
+							fmt.Sprintf("Connect: Enter %s (mode=%s) • p pane • c new-window • v split-v • s split-h • t tiled • w new window • W windows (all selected)\n", m.enterModeLabel(), m.enterMode)+
 							"Selection: Space toggle-select • ctrl+a select-all (filtered) • f favorite • F favorites • R recents • A all\n"+
 							"Dashboards: B browser • :dash [name] • l layout override (in dashboards)\n"+
 							"Network: N view • :net • :network\n"+
@@ -4003,28 +4153,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.ClearScreen
 
 				case "connect", "c":
-					// Reuse Enter/c behavior by directly invoking the same logic:
-					// create window(s) for selected/current then quit.
+					// :connect / :c — connect in existing pane (single host only).
 					targets := m.currentOrSelectedResolved()
 					if len(targets) == 0 {
 						m.setStatus("No target selected", 1500)
 						return m, tea.ClearScreen
 					}
-					failed := 0
-					for _, r := range targets {
-						if _, err := m.tmuxNewWindow(r); err != nil {
-							if _, serr := m.tmuxSplitV(r); serr != nil {
-								failed++
-								continue
-							}
-						}
-						m.addRecent(r.Host.Name)
+					if len(targets) != 1 {
+						m.setStatus("Connect (existing pane) supports a single host. Use :window for multi-select.", 3500)
+						return m, tea.ClearScreen
 					}
-					if failed > 0 {
-						m.setStatus(fmt.Sprintf("Opened %d, %d failed", len(targets)-failed, failed), 2500)
-					}
+					r := targets[0]
+					m.addRecent(r.Host.Name)
 					m.saveState()
-					return m.quit()
+					return m.connectOrQuit(r)
 
 				case "window", "w":
 					// Alias to "connect in new window(s)"
@@ -4526,8 +4668,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, cmd
 
 			case "enter":
-				// Confirm current selection while staying in the main flow.
-				// Mirror tmux-session-manager behavior: accept even if search is focused.
+				// Dispatch Enter based on configured enter mode.
+				// Blur search input, then connect to the current (highlighted) host.
 				m.input.Blur()
 				m.recomputeFilter()
 				targets := m.selectedResolved()
@@ -4539,35 +4681,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if len(targets) == 0 {
 					return m, nil
 				}
-
-				// Outside tmux: connect inline (single target only).
-				if strings.TrimSpace(os.Getenv("TMUX")) == "" {
-					if len(targets) != 1 {
-						m.setStatus("Multi-select connect requires tmux (panes/windows). Start tmux or select a single host.", 3500)
-						return m, nil
-					}
-					r := targets[0]
-					m.addRecent(r.Host.Name)
-					m.saveState()
-					return m.connectOrQuit(r)
-				}
-
-				// In tmux: default to new window(s), with split fallback (same as main Enter behavior).
-				failed := 0
-				for _, r := range targets {
-					if _, err := m.tmuxNewWindow(r); err != nil {
-						if _, serr := m.tmuxSplitV(r); serr != nil {
-							failed++
-							continue
-						}
-					}
-					m.addRecent(r.Host.Name)
-				}
-				if failed > 0 {
-					m.setStatus(fmt.Sprintf("Opened %d, %d failed", len(targets)-failed, failed), 2500)
-				}
-				m.saveState()
-				return m.quit()
+				return m.enterActionMulti(targets)
 
 			case "ctrl+a":
 				// Quick select-all in insert-mode:
@@ -4749,7 +4863,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.netQuery.Blur()
 			return m, tea.Batch(tea.ClearScreen, runLLDPCollectionCmd(m.cfg, targets))
 
-		case "enter", "c":
+		case "enter":
+			// Dispatch Enter based on configured enter mode.
+			targets := m.selectedResolved()
+			if len(targets) == 0 {
+				if sel := m.current(); sel != nil {
+					targets = []ResolvedHost{sel.Resolved}
+				}
+			}
+			if len(targets) == 0 {
+				return m, nil
+			}
+			return m.enterActionMulti(targets)
+		case "p":
+			// Always connect in the existing pane (inline connect), regardless of enter mode.
+			if sel := m.current(); sel != nil {
+				m.addRecent(sel.Resolved.Host.Name)
+				m.saveState()
+				return m.connectOrQuit(sel.Resolved)
+			}
+			return m, nil
+		case "c":
 			// If there are multi-selected hosts, operate on all of them.
 			// Otherwise, operate on the current host.
 			targets := m.selectedResolved()
@@ -5420,11 +5554,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+			// If we're not in tmux, connect inline (can't create windows outside tmux).
+			if strings.TrimSpace(os.Getenv("TMUX")) == "" {
+				if len(targets) != 1 {
+					m.setStatus("Multi-select window requires tmux. Start tmux or select a single host.", 3500)
+					return m, nil
+				}
+				r := targets[0]
+				m.addRecent(r.Host.Name)
+				m.saveState()
+				return m.connectOrQuit(r)
+			}
+
 			failed := 0
 			for _, r := range targets {
 				if _, err := m.tmuxNewWindow(r); err != nil {
-					failed++
-					continue
+					if _, serr := m.tmuxSplitV(r); serr != nil {
+						failed++
+						continue
+					}
 				}
 				m.addRecent(r.Host.Name)
 			}
@@ -5978,7 +6126,7 @@ func (m model) View() string {
 			b.WriteString(m.netQuery.View() + "\n")
 			b.WriteString("Keys: Enter search • Esc cancel\n")
 		} else {
-			b.WriteString("Keys: j/k or Tab move • Enter/c connect • v split-v • s split-h • / search • r refresh • Esc/q close\n")
+			b.WriteString(fmt.Sprintf("Keys: j/k or Tab move • Enter %s • p pane • c/w window • v split-v • s split-h • / search • r refresh • Esc/q close\n", m.enterModeLabel()))
 		}
 		return b.String()
 	}
@@ -5992,7 +6140,7 @@ func (m model) View() string {
 		b.WriteString("\n")
 		b.WriteString("Network View (when open):\n")
 		b.WriteString("Keys: j/k or Tab: move focus • /: search/jump • r: refresh\n")
-		b.WriteString("  Enter/c: connect (configured node only) • v: split-v (tmux) • s: split-h (tmux)\n")
+		b.WriteString(fmt.Sprintf("  Enter: %s (mode=%s) • p: pane • c/w: new window (configured node only) • v: split-v • s: split-h\n", m.enterModeLabel(), m.enterMode))
 		b.WriteString("  m: cycle view (layered/edges/list) • b: toggle box drawing\n")
 		b.WriteString("  Esc/q: close network view\n\n")
 		b.WriteString("Logs:\n")
@@ -6412,7 +6560,9 @@ func (m model) View() string {
 		b.WriteString("  / search (forward) • ? search (backward) • n/N next/prev match • : command (try :menu) • q/esc quit\n\n")
 		b.WriteString(m.theme.HelpText("Actions (current/selected):") + "\n")
 		b.WriteString("  Ctrl+s: save current window as a recorded dashboard (auto-named)\n")
-		b.WriteString("  Enter or c: connect in new tmux window (default)\n")
+		b.WriteString(fmt.Sprintf("  Enter: connect (%s, mode=%s; set @tmux_ssh_manager_enter_mode)\n", m.enterModeLabel(), m.enterMode))
+		b.WriteString("  p: connect in existing pane\n")
+		b.WriteString("  c: connect in new tmux window\n")
 		b.WriteString("  v: split vertically (side-by-side) and connect\n")
 		b.WriteString("  s: split horizontally (stacked) and connect\n")
 		b.WriteString("  w: new window and connect   W: new window for all selected\n")
@@ -6687,7 +6837,7 @@ func (m model) View() string {
 	if m.recording {
 		recState = "ON"
 	}
-	b.WriteString(fmt.Sprintf("\nKeys: j/k move • / search • ? reverse • Enter connect • Space multi • e edit-ssh • S host settings • E ssh-export • I ssh-import • M merge-dups • :menu • :help • q quit   |   managed panes: %d   |   REC: %s\n", managed, recState))
+	b.WriteString(fmt.Sprintf("\nKeys: j/k move • / search • ? reverse • Enter %s • p pane • w window • Space multi • e edit-ssh • S host settings • E ssh-export • I ssh-import • M merge-dups • :menu • :help • q quit   |   managed panes: %d   |   REC: %s\n", m.enterModeLabel(), managed, recState))
 
 	return b.String()
 }
