@@ -228,9 +228,12 @@ if [[ "${LAUNCH_MODE}" == "pane" ]]; then
   fi
 
   # send-keys runs the command in the *current* pane (the caller pane itself).
-  # We use send-keys rather than eval so that tmux manages the process lifetime
-  # and the user's shell history/environment is preserved after the TUI exits.
-  tmux send-keys "${ENV_PREFIX} ${CMD_STR}" Enter
+  # Strip the 'exec' prefix: in pane mode the TUI must NOT replace the shell
+  # because after the TUI exits it sends a deferred `tmux send-keys` with the
+  # SSH command back to this same pane — the shell must still be alive to
+  # receive and execute it.
+  PANE_CMD_STR="${CMD_STR#exec }"
+  tmux send-keys "${ENV_PREFIX} ${PANE_CMD_STR}" Enter
   exit 0
 fi
 
