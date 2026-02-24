@@ -84,15 +84,11 @@ if (( NEED_BUILD )); then
     fi
 
     REPO_COMMIT="${REPO_COMMIT:-$(cd "${REPO_ROOT}" && git rev-parse HEAD 2>/dev/null || true)}"
-    LDFLAGS=""
-    if [[ -n "${REPO_COMMIT}" ]]; then
-      LDFLAGS="-ldflags=-X main.BuildCommit=${REPO_COMMIT}"
-    fi
 
     mkdir -p "${REPO_ROOT}/bin" 2>/dev/null || true
     tmux display-message -d 2000 "tmux-ssh-manager: building Go binary..."
-    if [[ -n "${LDFLAGS}" ]]; then
-      if ! (cd "${REPO_ROOT}" && go build ${LDFLAGS} -o "bin/tmux-ssh-manager" "./cmd/tmux-ssh-manager"); then
+    if [[ -n "${REPO_COMMIT}" ]]; then
+      if ! (cd "${REPO_ROOT}" && go build -ldflags "-X main.BuildCommit=${REPO_COMMIT}" -o "bin/tmux-ssh-manager" "./cmd/tmux-ssh-manager"); then
         tmux display-message -d 8000 "tmux-ssh-manager: build failed. Try: (cd ${REPO_ROOT} && go build -o bin/tmux-ssh-manager ./cmd/tmux-ssh-manager)"
         exit 1
       fi
