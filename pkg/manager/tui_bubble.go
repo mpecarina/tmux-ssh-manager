@@ -8271,13 +8271,24 @@ func (m *model) tmuxSendToCallerPane(r ResolvedHost) error {
 	}
 
 	// Build the ssh command line.
-	// IMPORTANT: Always use the direct `command ssh ...` form for pane mode.
-	// The internal PTY connector (__connect / askpass) creates its own pseudo-terminal,
-	// which cannot read interactive input (passwords) from the caller pane's TTY when
-	// launched via `tmux send-keys`. The caller pane already has an interactive terminal,
-	// so the standard OpenSSH client handles password/passphrase prompts natively.
-	argv := BuildSSHCommand(r)
-	line := "command " + shellQuoteCmdSimple(argv)
+	// For askpass: use the internal PTY connector (__connect) so stored keychain passwords work.
+	// For manual/identity: use the real OpenSSH client directly (`command ssh ...`) to avoid
+	// double tmux-wrapping / wrapper re-entry (especially when users alias ssh->tmux-ssh-manager ssh).
+	line := ""
+	if strings.EqualFold(strings.TrimSpace(m.effectiveLoginMode(r)), "askpass") {
+		bin := strings.TrimSpace(os.Getenv("TMUX_SSH_MANAGER_BIN"))
+		if bin == "" {
+			bin = "tmux-ssh-manager"
+		}
+		userFlag := ""
+		if strings.TrimSpace(r.EffectiveUser) != "" {
+			userFlag = " --user " + shellEscapeForSh(strings.TrimSpace(r.EffectiveUser))
+		}
+		line = shellEscapeForSh(bin) + " __connect --host " + shellEscapeForSh(strings.TrimSpace(r.Host.Name)) + userFlag
+	} else {
+		argv := BuildSSHCommand(r)
+		line = "command " + shellQuoteCmdSimple(argv)
+	}
 
 	// Run pre-connect local hooks
 	_ = runLocalHooks(r.EffectivePreConnect)
