@@ -212,61 +212,6 @@ func (m model) handlePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.input.Blur()
 			m.recompute()
 			return m, nil
-		case "v":
-			if m.app.ImplicitSelect {
-				m.input.Blur()
-				return m.runMulti(m.app.SplitVert, "opened vertical splits")
-			}
-			var cmd tea.Cmd
-			m.input, cmd = m.input.Update(msg)
-			m.recompute()
-			return m, cmd
-		case "s":
-			if m.app.ImplicitSelect {
-				m.input.Blur()
-				return m.runMulti(m.app.SplitHoriz, "opened horizontal splits")
-			}
-			var cmd tea.Cmd
-			m.input, cmd = m.input.Update(msg)
-			m.recompute()
-			return m, cmd
-		case "w":
-			if m.app.ImplicitSelect {
-				m.input.Blur()
-				return m.runMulti(m.app.NewWindow, "opened tmux windows")
-			}
-			var cmd tea.Cmd
-			m.input, cmd = m.input.Update(msg)
-			m.recompute()
-			return m, cmd
-		case "t":
-			if m.app.ImplicitSelect {
-				m.input.Blur()
-				return m.runTiled()
-			}
-			var cmd tea.Cmd
-			m.input, cmd = m.input.Update(msg)
-			m.recompute()
-			return m, cmd
-		case "p":
-			if m.app.ImplicitSelect {
-				m.input.Blur()
-				current := m.current()
-				if current == nil {
-					return m, nil
-				}
-				m.app.State.AddRecent(current.host.Alias)
-				_ = state.Save(m.app.StatePath, m.app.State)
-				m.enableLogging(current.host.Alias)
-				cmd := m.app.Connect(current.host.Alias)
-				return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
-					return quitMsg{}
-				})
-			}
-			var cmd tea.Cmd
-			m.input, cmd = m.input.Update(msg)
-			m.recompute()
-			return m, cmd
 		case "ctrl+a":
 			if len(m.filtered) == 0 {
 				m.status = "Selected: 0"
@@ -278,6 +223,7 @@ func (m model) handlePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.status = fmt.Sprintf("Selected: %d", len(m.selectedAliases))
 			return m, nil
 		}
+
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
 		m.recompute()

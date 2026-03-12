@@ -60,7 +60,7 @@ Imports flow downward. Packages do not import each other laterally.
 Two modes:
 
 1. **CLI mode** — `list [--json]`, `connect [--split-count N] [--split-mode window|v|h] [--layout tiled]`, `add`, `cred`, `print-ssh-config-path`, `--version`
-2. **Picker mode** — default (no subcommand), Bubble Tea alt-screen UI. Starts in search mode (input focused) by default. Use `--mode normal` (`-m normal`) to start with search blurred for vim-style navigation. With `--implicit-select` (on by default), `enter`/`v`/`s`/`w` act on the highlighted host directly from search mode. Disable with `--implicit-select=false` or `set -g @tmux_ssh_manager_implicit_select 'off'`. The `--enter-mode` flag (default `p`) controls what `enter` does: `p` (pane/connect in place), `w` (new window), `s` (horizontal split), `v` (vertical split). Configure via `set -g @tmux_ssh_manager_enter_mode 'p'`.
+2. **Picker mode** — default (no subcommand), Bubble Tea alt-screen UI. Starts in search mode (input focused) by default. Use `--mode normal` (`-m normal`) to start with search blurred for vim-style navigation. With `--implicit-select` (on by default), `enter` acts on the highlighted host directly from search mode. Action keys (`v`/`s`/`w`/`t`/`p`) only work in normal mode — press `Esc` first to exit search, then use action keys. Disable implicit select with `--implicit-select=false` or `set -g @tmux_ssh_manager_implicit_select 'off'`. The `--enter-mode` flag (default `p`) controls what `enter` does: `p` (pane/connect in place), `w` (new window), `s` (horizontal split), `v` (vertical split). Configure via `set -g @tmux_ssh_manager_enter_mode 'p'`.
 
 ### Picker Keybindings
 
@@ -71,12 +71,12 @@ Two modes:
 | `ctrl+d`/`ctrl+u` | Half-page scroll |
 | `gg`/`G` | Jump to top/bottom |
 | `space` | Toggle multi-select |
-| `enter` | Connect in place |
-| `v` | Split vertical |
-| `s` | Split horizontal |
-| `w` | New tmux window |
-| `t` | Tiled layout (multi-select) |
-| `p` | Connect in current pane |
+| `enter` | Connect in place (works in search mode via implicit select) |
+| `v` | Split vertical (normal mode only) |
+| `s` | Split horizontal (normal mode only) |
+| `w` | New tmux window (normal mode only) |
+| `t` | Tiled layout, multi-select (normal mode only) |
+| `p` | Connect in current pane (normal mode only) |
 | `f` | Toggle favorite |
 | `F` | Filter favorites |
 | `R` | Filter recents |

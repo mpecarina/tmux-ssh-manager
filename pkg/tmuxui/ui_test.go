@@ -208,7 +208,7 @@ func TestImplicitSelectOff(t *testing.T) {
 }
 
 func TestImplicitSelectSplitInSearchMode(t *testing.T) {
-	var split []string
+	splitCalled := false
 	m := newModel(App{
 		Hosts: []sshconfig.Host{
 			{Alias: "h1", HostName: "10.0.0.1"},
@@ -220,22 +220,62 @@ func TestImplicitSelectSplitInSearchMode(t *testing.T) {
 		StatePath:      t.TempDir() + "/state.json",
 		InTmux:         func() bool { return true },
 		SplitVert: func(alias string) error {
-			split = append(split, alias)
+			splitCalled = true
 			return nil
 		},
 	})
 
-	// Press 'v' in search mode with implicit select should split the highlighted host.
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
-	if cmd == nil {
-		t.Fatal("expected a command from v in search mode with implicit select")
+	// Press 'v' in search mode should type into search, not trigger split.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
+	m = updated.(model)
+	if splitCalled {
+		t.Fatal("pressing 'v' in search mode should not trigger split")
 	}
-	msg := cmd()
-	if _, ok := msg.(quitMsg); !ok {
-		t.Fatalf("expected quitMsg, got %T", msg)
+	if m.input.Value() != "v" {
+		t.Fatalf("expected search input 'v', got %q", m.input.Value())
 	}
-	if len(split) != 1 || split[0] != "h1" {
-		t.Fatalf("expected vertical split on h1, got %v", split)
+}
+
+func TestSearchModeTypingDoesNotTriggerActions(t *testing.T) {
+	splitCalled := false
+	windowCalled := false
+	m := newModel(App{
+		Hosts: []sshconfig.Host{
+			{Alias: "staging", HostName: "10.0.0.1"},
+		},
+		StartInSearch:  true,
+		ImplicitSelect: true,
+		State:          &state.Store{},
+		StatePath:      t.TempDir() + "/state.json",
+		InTmux:         func() bool { return true },
+		SplitHoriz: func(alias string) error {
+			splitCalled = true
+			return nil
+		},
+		SplitVert: func(alias string) error {
+			splitCalled = true
+			return nil
+		},
+		NewWindow: func(alias string) error {
+			windowCalled = true
+			return nil
+		},
+	})
+
+	// Type "stag" — the 's' and 't' should go into search, not trigger split/tiled.
+	for _, r := range "stag" {
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(model)
+	}
+
+	if splitCalled {
+		t.Fatal("typing 's' in search should not trigger a split")
+	}
+	if windowCalled {
+		t.Fatal("typing 'w' in search should not trigger a window")
+	}
+	if m.input.Value() != "stag" {
+		t.Fatalf("expected search input 'stag', got %q", m.input.Value())
 	}
 }
 
@@ -383,12 +423,14 @@ func TestTiledInSearchMode(t *testing.T) {
 		NewWindow: func(alias string) error { return nil },
 	})
 
-	// Select all and press t in search mode
+	// Select all, then Esc to normal mode, then press t.
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlA})
+	m = updated.(model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEscape})
 	m = updated.(model)
 	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
 	if cmd == nil {
-		t.Fatal("expected a command from t in search mode")
+		t.Fatal("expected a command from t after esc to normal mode")
 	}
 	msg := cmd()
 	if _, ok := msg.(quitMsg); !ok {
