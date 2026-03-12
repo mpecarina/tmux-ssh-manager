@@ -20,10 +20,27 @@ if [[ -z "${LAUNCH_MODE}" ]]; then
   LAUNCH_MODE="popup"
 fi
 
+# Auto-build: rebuild when binary is missing or git commit has changed.
+STAMP_FILE="${BIN_PATH}.commit"
+CURRENT_COMMIT="$(cd "${REPO_ROOT}" && git rev-parse HEAD 2>/dev/null || echo unknown)"
+NEEDS_BUILD=0
+
 if [[ ! -x "${BIN_PATH}" ]]; then
-  tmux display-message -d 5000 "tmux-ssh-manager: binary not found at ${BIN_PATH}"
-  tmux display-message -d 5000 "Build it with: ${REPO_ROOT}/scripts/harness.sh build"
-  exit 1
+  NEEDS_BUILD=1
+elif [[ ! -f "${STAMP_FILE}" ]]; then
+  NEEDS_BUILD=1
+elif [[ "$(cat "${STAMP_FILE}" 2>/dev/null)" != "${CURRENT_COMMIT}" ]]; then
+  NEEDS_BUILD=1
+fi
+
+if [[ "${NEEDS_BUILD}" -eq 1 ]]; then
+  tmux display-message "tmux-ssh-manager: building..."
+  if (cd "${REPO_ROOT}" && go build -ldflags "-X tmux-ssh-manager/pkg/app.Version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)" -o "${BIN_PATH}" ./cmd/tmux-ssh-manager) 2>/dev/null; then
+    echo "${CURRENT_COMMIT}" > "${STAMP_FILE}"
+  else
+    tmux display-message -d 5000 "tmux-ssh-manager: build failed — run '${REPO_ROOT}/scripts/harness.sh build' manually"
+    exit 1
+  fi
 fi
 
 BIN_ARGS=()

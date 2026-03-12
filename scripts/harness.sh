@@ -18,6 +18,8 @@ run_test() {
 run_build() {
   mkdir -p "${BIN_DIR}"
   (cd "${ROOT_DIR}" && go build -ldflags "-X tmux-ssh-manager/pkg/app.Version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)" -o "${BIN_PATH}" ./cmd/tmux-ssh-manager)
+  # Write commit stamp so the launcher can detect stale builds.
+  (cd "${ROOT_DIR}" && git rev-parse HEAD 2>/dev/null || echo unknown) > "${BIN_PATH}.commit"
 }
 
 run_smoke() {
