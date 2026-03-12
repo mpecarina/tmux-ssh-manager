@@ -1,336 +1,46 @@
 #!/usr/bin/env bash
-# Launcher for tmux-ssh-manager (popup by default; also supports window and pane).
 set -euo pipefail
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${CURRENT_DIR}/.." && pwd)"
 
 BIN_PATH="$(tmux show -gqv @tmux_ssh_manager_bin || true)"
-CONFIG_PATH="$(tmux show -gqv @tmux_ssh_manager_config || true)"
-TUI_SOURCE="$(tmux show -gqv @tmux_ssh_manager_tui_source || true)"
-SSH_CONFIG_OPT="$(tmux show -gqv @tmux_ssh_manager_ssh_config || true)"
 LAUNCH_MODE="$(tmux show -gqv @tmux_ssh_manager_launch_mode || true)"
-PICKER_MODE="$(tmux show -gqv @tmux_ssh_manager_picker || true)"
+PICKER_MODE="$(tmux show -gqv @tmux_ssh_manager_mode || true)"
+IMPLICIT_SELECT="$(tmux show -gqv @tmux_ssh_manager_implicit_select || true)"
+ENTER_MODE="$(tmux show -gqv @tmux_ssh_manager_enter_mode || true)"
 
-GPG_SYMMETRIC_OPT="$(tmux show -gqv @tmux_ssh_manager_gpg_symmetric || true)"
-GPG_PASSPHRASE_FILE_OPT="$(tmux show -gqv @tmux_ssh_manager_gpg_passphrase_file || true)"
-GPG_RECIPIENT_OPT="$(tmux show -gqv @tmux_ssh_manager_gpg_recipient || true)"
-GPG_BINARY_OPT="$(tmux show -gqv @tmux_ssh_manager_gpg_binary || true)"
-ENTER_MODE_OPT="$(tmux show -gqv @tmux_ssh_manager_enter_mode || true)"
-
-# Force SSH mode by default for tmux keybinding launches (never require YAML).
-# Users can still override with: set -g @tmux_ssh_manager_tui_source 'yaml'
-if [[ -z "${TUI_SOURCE}" ]]; then
-  TUI_SOURCE="ssh"
-fi
-
-
-# Defaults
 if [[ -z "${BIN_PATH}" ]]; then
   BIN_PATH="${REPO_ROOT}/bin/tmux-ssh-manager"
 fi
-if [[ -z "${CONFIG_PATH}" ]]; then
-  CONFIG_PATH="${HOME}/.config/tmux-ssh-manager/hosts.yaml"
-fi
-
-# Expand a leading "~/" in user-configured paths (tmux options often include it).
-# Important: only expand if the string actually starts with "~/" (not ".../~/" somewhere in the middle).
 if [[ "${BIN_PATH}" == "~/"* ]]; then
   BIN_PATH="${HOME}/${BIN_PATH:2}"
 fi
-if [[ "${CONFIG_PATH}" == "~/"* ]]; then
-  CONFIG_PATH="${HOME}/${CONFIG_PATH:2}"
-fi
-
-# Default launch mode to "popup".
 if [[ -z "${LAUNCH_MODE}" ]]; then
   LAUNCH_MODE="popup"
 fi
-# Normalize to one of: popup | window | pane
-case "${LAUNCH_MODE}" in
-  popup|window|pane) ;;
-  *) LAUNCH_MODE="popup" ;;
-esac
-
-
-
-# ---------------------------------------------------------------------------
-# Auto-build / rebuild logic
-# ---------------------------------------------------------------------------
-DEFAULT_BIN_PATH="${REPO_ROOT}/bin/tmux-ssh-manager"
-NEED_BUILD=0
 
 if [[ ! -x "${BIN_PATH}" ]]; then
-  # Binary doesn't exist at all — need to build.
-  NEED_BUILD=1
-elif [[ "${BIN_PATH}" == "${DEFAULT_BIN_PATH}" ]]; then
-  # Binary exists and uses the repo-local path — check commit freshness.
-  # git rev-parse HEAD gives the current repo commit; the binary reports
-  # the commit it was built with via --build-commit (stamped by -ldflags).
-  REPO_COMMIT="$(cd "${REPO_ROOT}" && git rev-parse HEAD 2>/dev/null || true)"
-  BIN_COMMIT="$("${BIN_PATH}" --build-commit 2>/dev/null || true)"
-  if [[ -n "${REPO_COMMIT}" ]] && [[ "${BIN_COMMIT}" != "${REPO_COMMIT}" ]]; then
-    NEED_BUILD=1
-  fi
-fi
-
-if (( NEED_BUILD )); then
-  # Only auto-build when using the default (repo-local) binary location.
-  # If the user set @tmux_ssh_manager_bin, don't build into arbitrary paths.
-  if [[ "${BIN_PATH}" == "${DEFAULT_BIN_PATH}" ]]; then
-    if ! command -v go >/dev/null 2>&1; then
-      tmux display-message -d 7000 "tmux-ssh-manager: 'go' not found; cannot build ${DEFAULT_BIN_PATH}"
-      tmux display-message -d 7000 "Install Go or set: set -g @tmux_ssh_manager_bin '/path/to/tmux-ssh-manager'"
-      exit 1
-    fi
-
-    REPO_COMMIT="${REPO_COMMIT:-$(cd "${REPO_ROOT}" && git rev-parse HEAD 2>/dev/null || true)}"
-
-    mkdir -p "${REPO_ROOT}/bin" 2>/dev/null || true
-    tmux display-message -d 2000 "tmux-ssh-manager: building Go binary..."
-    if [[ -n "${REPO_COMMIT}" ]]; then
-      if ! (cd "${REPO_ROOT}" && go build -ldflags "-X main.BuildCommit=${REPO_COMMIT}" -o "bin/tmux-ssh-manager" "./cmd/tmux-ssh-manager"); then
-        tmux display-message -d 8000 "tmux-ssh-manager: build failed. Try: (cd ${REPO_ROOT} && go build -o bin/tmux-ssh-manager ./cmd/tmux-ssh-manager)"
-        exit 1
-      fi
-    else
-      if ! (cd "${REPO_ROOT}" && go build -o "bin/tmux-ssh-manager" "./cmd/tmux-ssh-manager"); then
-        tmux display-message -d 8000 "tmux-ssh-manager: build failed. Try: (cd ${REPO_ROOT} && go build -o bin/tmux-ssh-manager ./cmd/tmux-ssh-manager)"
-        exit 1
-      fi
-    fi
-  fi
-
-  if [[ ! -x "${BIN_PATH}" ]]; then
-    tmux display-message -d 5000 "tmux-ssh-manager: binary not found or not executable at: ${BIN_PATH}"
-    tmux display-message -d 5000 "Build it with: (cd ${REPO_ROOT} && go build -o bin/tmux-ssh-manager ./cmd/tmux-ssh-manager)"
-    tmux display-message -d 5000 "Or set: set -g @tmux_ssh_manager_bin '/path/to/tmux-ssh-manager'"
-    exit 1
-  fi
-fi
-
-CMD_STR="exec \"${BIN_PATH}\""
-
-# Decide TUI source:
-# - If @tmux_ssh_manager_tui_source is set, honor it ('yaml' or 'ssh')
-# - Default (when unset): SSH aliases (never require YAML)
-effective_source=""
-if [[ -n "${TUI_SOURCE}" ]]; then
-  if [[ "${TUI_SOURCE}" == "ssh" ]]; then
-    effective_source="ssh"
-  else
-    effective_source="yaml"
-  fi
-else
-  effective_source="ssh"
-fi
-
-# Build command flags based on the effective source and available paths
-if [[ "${effective_source}" == "yaml" ]]; then
-  if [[ -f "${CONFIG_PATH}" ]]; then
-    CMD_STR+=" --tui-source yaml --config \"${CONFIG_PATH}\""
-  else
-    tmux display-message -d 2500 "tmux-ssh-manager: YAML config missing, falling back to SSH aliases"
-    CMD_STR+=" --tui-source ssh"
-    if [[ -n "${SSH_CONFIG_OPT}" ]]; then
-      CMD_STR+=" --ssh-config \"${SSH_CONFIG_OPT}\""
-    fi
-  fi
-else
-  CMD_STR+=" --tui-source ssh"
-  if [[ -n "${SSH_CONFIG_OPT}" ]]; then
-    CMD_STR+=" --ssh-config \"${SSH_CONFIG_OPT}\""
-  fi
-fi
-
-# Optional picker:
-# - tui (default): built-in Bubble Tea UI
-# - fzf: external fuzzy picker with multi-select (space toggles selection inside fzf; space allowed in query)
-if [[ -z "${PICKER_MODE}" ]]; then
-  PICKER_MODE="tui"
-fi
-if [[ "${PICKER_MODE}" == "fzf" ]]; then
-  CMD_STR+=" --fzf"
-fi
-
-if ! tmux display-message -d 1 "tmux-ssh-manager: starting" >/dev/null 2>&1; then
-  echo "tmux-ssh-manager: executing: ${CMD_STR}"
-  eval "${CMD_STR}"
-  exit_code=$?
-  if [[ $exit_code -ne 0 ]]; then
-    echo "tmux-ssh-manager: command failed with exit code ${exit_code}"
-  fi
-  exit $exit_code
-fi
-
-# Determine tmux version for popup support (require >= 3.3)
-version_raw="$(tmux -V 2>/dev/null | awk '{print $2}')"
-# Extract numeric major.minor (handles suffixes like 3.3a)
-ver_major="${version_raw%%.*}"
-ver_minor_patch="${version_raw#*.}"
-ver_minor="${ver_minor_patch%%[^0-9]*}"
-
-supports_popup=false
-if [[ -n "${ver_major}" && -n "${ver_minor}" ]]; then
-  if (( ver_major > 3 )) || (( ver_major == 3 && ver_minor >= 3 )); then
-    supports_popup=true
-  fi
-fi
-
-POPUP_WRAPPER="${REPO_ROOT}/scripts/popup_wrapper.sh"
-
-# Capture the pane that triggered the launch so "pane" mode can send-keys back to it.
-# We store this in a tmux server option because pane IDs contain '%' (e.g., %0) which
-# tmux interprets as format specifiers when embedded in new-window/display-popup command strings.
-# tmux set/show handles the value verbatim without interpretation.
-CALLER_PANE="$(tmux display-message -p '#{pane_id}' 2>/dev/null || true)"
-if [[ -n "${CALLER_PANE}" ]]; then
-  tmux set -g @tmux_ssh_manager_caller_pane "${CALLER_PANE}"
-fi
-
-
-# ---------------------------------------------------------------------------
-# Pane mode: run the TUI directly in the current pane (no new window/popup).
-# ---------------------------------------------------------------------------
-if [[ "${LAUNCH_MODE}" == "pane" ]]; then
-  tmux display-message -d 1500 "tmux-ssh-manager: launching in pane"
-
-  ENV_PREFIX="TERM=xterm-256color TMUX_SSH_MANAGER_BIN=$(printf %q "${BIN_PATH}")"
-
-  if [[ -n "${GPG_SYMMETRIC_OPT}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_SYMMETRIC=$(printf %q "${GPG_SYMMETRIC_OPT}")"
-  elif [[ -n "${TMUX_SSH_MANAGER_GPG_SYMMETRIC-}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_SYMMETRIC=$(printf %q "${TMUX_SSH_MANAGER_GPG_SYMMETRIC}")"
-  fi
-
-  if [[ -n "${GPG_PASSPHRASE_FILE_OPT}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_PASSPHRASE_FILE=$(printf %q "${GPG_PASSPHRASE_FILE_OPT}")"
-  elif [[ -n "${TMUX_SSH_MANAGER_GPG_PASSPHRASE_FILE-}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_PASSPHRASE_FILE=$(printf %q "${TMUX_SSH_MANAGER_GPG_PASSPHRASE_FILE}")"
-  fi
-
-  if [[ -n "${GPG_RECIPIENT_OPT}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_RECIPIENT=$(printf %q "${GPG_RECIPIENT_OPT}")"
-  elif [[ -n "${TMUX_SSH_MANAGER_GPG_RECIPIENT-}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_RECIPIENT=$(printf %q "${TMUX_SSH_MANAGER_GPG_RECIPIENT}")"
-  fi
-
-  if [[ -n "${GPG_BINARY_OPT}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_BINARY=$(printf %q "${GPG_BINARY_OPT}")"
-  elif [[ -n "${TMUX_SSH_MANAGER_GPG_BINARY-}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_BINARY=$(printf %q "${TMUX_SSH_MANAGER_GPG_BINARY}")"
-  fi
-
-  if [[ -n "${ENTER_MODE_OPT}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_ENTER_MODE=$(printf %q "${ENTER_MODE_OPT}")"
-  elif [[ -n "${TMUX_SSH_MANAGER_ENTER_MODE-}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_ENTER_MODE=$(printf %q "${TMUX_SSH_MANAGER_ENTER_MODE}")"
-  fi
-
-  # send-keys runs the command in the *current* pane (the caller pane itself).
-  # Strip the 'exec' prefix: in pane mode the TUI must NOT replace the shell
-  # because after the TUI exits it sends a deferred `tmux send-keys` with the
-  # SSH command back to this same pane — the shell must still be alive to
-  # receive and execute it.
-  PANE_CMD_STR="${CMD_STR#exec }"
-  tmux send-keys "${ENV_PREFIX} ${PANE_CMD_STR}" Enter
-  exit 0
-fi
-
-# ---------------------------------------------------------------------------
-# Window mode
-# ---------------------------------------------------------------------------
-if [[ "${LAUNCH_MODE}" == "window" ]]; then
-  tmux display-message -d 1500 "tmux-ssh-manager: launching window"
-
-  ENV_PREFIX="TERM=xterm-256color TMUX_SSH_MANAGER_BIN=$(printf %q "${BIN_PATH}")"
-
-  # Prefer explicit tmux options (reliable for keybinding launches), fall back to process env.
-  if [[ -n "${GPG_SYMMETRIC_OPT}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_SYMMETRIC=$(printf %q "${GPG_SYMMETRIC_OPT}")"
-  elif [[ -n "${TMUX_SSH_MANAGER_GPG_SYMMETRIC-}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_SYMMETRIC=$(printf %q "${TMUX_SSH_MANAGER_GPG_SYMMETRIC}")"
-  fi
-
-  if [[ -n "${GPG_PASSPHRASE_FILE_OPT}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_PASSPHRASE_FILE=$(printf %q "${GPG_PASSPHRASE_FILE_OPT}")"
-  elif [[ -n "${TMUX_SSH_MANAGER_GPG_PASSPHRASE_FILE-}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_PASSPHRASE_FILE=$(printf %q "${TMUX_SSH_MANAGER_GPG_PASSPHRASE_FILE}")"
-  fi
-
-  if [[ -n "${GPG_RECIPIENT_OPT}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_RECIPIENT=$(printf %q "${GPG_RECIPIENT_OPT}")"
-  elif [[ -n "${TMUX_SSH_MANAGER_GPG_RECIPIENT-}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_RECIPIENT=$(printf %q "${TMUX_SSH_MANAGER_GPG_RECIPIENT}")"
-  fi
-
-  if [[ -n "${GPG_BINARY_OPT}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_BINARY=$(printf %q "${GPG_BINARY_OPT}")"
-  elif [[ -n "${TMUX_SSH_MANAGER_GPG_BINARY-}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_BINARY=$(printf %q "${TMUX_SSH_MANAGER_GPG_BINARY}")"
-  fi
-
-  if [[ -n "${ENTER_MODE_OPT}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_ENTER_MODE=$(printf %q "${ENTER_MODE_OPT}")"
-  elif [[ -n "${TMUX_SSH_MANAGER_ENTER_MODE-}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_ENTER_MODE=$(printf %q "${TMUX_SSH_MANAGER_ENTER_MODE}")"
-  fi
-
-  if ! tmux new-window -n "ssh-manager" -c "#{pane_current_path}" -- bash -lc "${ENV_PREFIX} ${CMD_STR}"; then
-    tmux display-message -d 10000 "tmux-ssh-manager: failed to open window."
-    exit 1
-  fi
-  exit 0
-fi
-
-if [[ "${supports_popup}" == true ]]; then
-  if [[ ! -x "${POPUP_WRAPPER}" ]]; then
-    tmux display-message -d 8000 "tmux-ssh-manager: popup wrapper not executable: ${POPUP_WRAPPER} (chmod +x it)"
-    exit 1
-  fi
-
-  HOST_LOGS_BASE="${HOME}/.config/tmux-ssh-manager/logs"
-
-  tmux display-message -d 1500 "tmux-ssh-manager: launching popup"
-  ENV_PREFIX="TERM=xterm-256color TMUX_SSH_MANAGER_IN_POPUP=1 TMUX_SSH_MANAGER_TITLE='tmux-ssh-manager' TMUX_SSH_MANAGER_HOST_LOGS_BASE=$(printf %q "${HOST_LOGS_BASE}") TMUX_SSH_MANAGER_BIN=$(printf %q "${BIN_PATH}")"
-
-  # Prefer explicit tmux options (reliable for keybinding launches), fall back to process env.
-  if [[ -n "${GPG_SYMMETRIC_OPT}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_SYMMETRIC=$(printf %q "${GPG_SYMMETRIC_OPT}")"
-  elif [[ -n "${TMUX_SSH_MANAGER_GPG_SYMMETRIC-}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_SYMMETRIC=$(printf %q "${TMUX_SSH_MANAGER_GPG_SYMMETRIC}")"
-  fi
-
-  if [[ -n "${GPG_PASSPHRASE_FILE_OPT}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_PASSPHRASE_FILE=$(printf %q "${GPG_PASSPHRASE_FILE_OPT}")"
-  elif [[ -n "${TMUX_SSH_MANAGER_GPG_PASSPHRASE_FILE-}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_PASSPHRASE_FILE=$(printf %q "${TMUX_SSH_MANAGER_GPG_PASSPHRASE_FILE}")"
-  fi
-
-  if [[ -n "${GPG_RECIPIENT_OPT}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_RECIPIENT=$(printf %q "${GPG_RECIPIENT_OPT}")"
-  elif [[ -n "${TMUX_SSH_MANAGER_GPG_RECIPIENT-}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_RECIPIENT=$(printf %q "${TMUX_SSH_MANAGER_GPG_RECIPIENT}")"
-  fi
-
-  if [[ -n "${GPG_BINARY_OPT}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_BINARY=$(printf %q "${GPG_BINARY_OPT}")"
-  elif [[ -n "${TMUX_SSH_MANAGER_GPG_BINARY-}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_GPG_BINARY=$(printf %q "${TMUX_SSH_MANAGER_GPG_BINARY}")"
-  fi
-
-  if [[ -n "${ENTER_MODE_OPT}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_ENTER_MODE=$(printf %q "${ENTER_MODE_OPT}")"
-  elif [[ -n "${TMUX_SSH_MANAGER_ENTER_MODE-}" ]]; then
-    ENV_PREFIX+=" TMUX_SSH_MANAGER_ENTER_MODE=$(printf %q "${TMUX_SSH_MANAGER_ENTER_MODE}")"
-  fi
-
-  if ! tmux display-popup -E -w 90% -h 80% -- bash -lc "${ENV_PREFIX} \"${POPUP_WRAPPER}\" --cmd $(printf %q "${CMD_STR}")"; then
-    tmux display-message -d 10000 "tmux-ssh-manager: popup failed."
-    exit 1
-  fi
-else
-  tmux display-message -d 10000 "tmux-ssh-manager: popup mode requires tmux >= 3.3 (detected: $(tmux -V 2>/dev/null | awk '{print $2}'))"
-  tmux display-message -d 10000 "tmux-ssh-manager: set -g @tmux_ssh_manager_launch_mode 'window'"
+  tmux display-message -d 5000 "tmux-ssh-manager: binary not found at ${BIN_PATH}"
+  tmux display-message -d 5000 "Build it with: ${REPO_ROOT}/scripts/harness.sh build"
   exit 1
 fi
+
+BIN_ARGS=()
+if [[ -n "${PICKER_MODE}" ]]; then
+  BIN_ARGS+=(--mode "${PICKER_MODE}")
+fi
+if [[ "${IMPLICIT_SELECT}" == "off" || "${IMPLICIT_SELECT}" == "false" ]]; then
+  BIN_ARGS+=(--implicit-select=false)
+fi
+if [[ -n "${ENTER_MODE}" ]]; then
+  BIN_ARGS+=(--enter-mode "${ENTER_MODE}")
+fi
+
+if [[ "${LAUNCH_MODE}" == "popup" ]]; then
+  if tmux display-popup -E -w 90% -h 80% -- "${BIN_PATH}" "${BIN_ARGS[@]+${BIN_ARGS[@]}}"; then
+    exit 0
+  fi
+fi
+
+tmux new-window -n "ssh-manager" "${BIN_PATH}" "${BIN_ARGS[@]+${BIN_ARGS[@]}}"

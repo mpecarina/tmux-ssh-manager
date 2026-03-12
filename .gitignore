@@ -35,6 +35,3 @@ services/mocks/*
 
 *.tgz
 bin/
-
-.ralph/
-.tasks/
