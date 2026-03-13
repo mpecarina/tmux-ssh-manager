@@ -39,6 +39,10 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 			return runCred(args[1:], stdout)
 		case "__askpass":
 			return runAskpass(args[1:], stdout)
+		case "ssh":
+			return runSSHPassthrough("ssh", args[1:])
+		case "scp":
+			return runSSHPassthrough("scp", args[1:])
 		case "print-ssh-config-path":
 			path, err := sshconfig.DefaultPrimaryPath()
 			if err != nil {
@@ -398,4 +402,89 @@ func runAskpass(args []string, stdout io.Writer) error {
 	}
 	_, err = fmt.Fprint(stdout, secret)
 	return err
+}
+
+// runSSHPassthrough execs the real ssh or scp binary with all original args,
+// injecting SSH_ASKPASS when a stored credential matches the destination host.
+func runSSHPassthrough(binary string, args []string) error {
+	binPath, err := exec.LookPath(binary)
+	if err != nil {
+		return fmt.Errorf("%s not found in PATH", binary)
+	}
+
+	cmd := exec.Command(binPath, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// Try to extract the destination host and inject askpass if a credential exists.
+	if dest := extractSSHDestination(binary, args); dest != "" {
+		hosts, loadErr := sshconfig.LoadDefault()
+		if loadErr == nil {
+			hostUsers := make(map[string]string, len(hosts))
+			for _, h := range hosts {
+				hostUsers[h.Alias] = h.User
+			}
+			user := hostUsers[dest]
+			if credentials.Get(dest, user, "password") == nil {
+				script := createAskpassScript()
+				if script != "" {
+					defer os.Remove(script)
+					cmd.Env = append(os.Environ(),
+						"TSSM_HOST="+dest,
+						"TSSM_USER="+user,
+						"SSH_ASKPASS="+script,
+						"SSH_ASKPASS_REQUIRE=force",
+						"DISPLAY=1",
+					)
+				}
+			}
+		}
+	}
+
+	return cmd.Run()
+}
+
+// extractSSHDestination extracts the destination host from ssh/scp arguments.
+// For ssh: first non-flag argument (user@host or host).
+// For scp: first argument containing ':' gives the remote host.
+// Returns just the host part (strips user@ prefix).
+func extractSSHDestination(binary string, args []string) string {
+	// ssh flags that consume the next argument.
+	sshArgFlags := map[string]bool{
+		"-b": true, "-c": true, "-D": true, "-E": true, "-e": true,
+		"-F": true, "-I": true, "-i": true, "-J": true, "-L": true,
+		"-l": true, "-m": true, "-O": true, "-o": true, "-p": true,
+		"-Q": true, "-R": true, "-S": true, "-W": true, "-w": true,
+	}
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		if strings.HasPrefix(arg, "-") {
+			if sshArgFlags[arg] && i+1 < len(args) {
+				i++ // skip the flag's value
+			}
+			continue
+		}
+		// For scp, look for user@host:path or host:path patterns.
+		if binary == "scp" {
+			if idx := strings.Index(arg, ":"); idx > 0 {
+				return hostFromDestination(arg[:idx])
+			}
+			continue
+		}
+		// For ssh, the first non-flag arg is the destination.
+		return hostFromDestination(arg)
+	}
+	return ""
+}
+
+func hostFromDestination(dest string) string {
+	if at := strings.LastIndex(dest, "@"); at >= 0 {
+		return dest[at+1:]
+	}
+	return dest
 }
