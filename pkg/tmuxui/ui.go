@@ -194,8 +194,6 @@ func (m model) handlePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "esc":
 			m.input.Blur()
-			m.input.SetValue("")
-			m.recompute()
 			return m, nil
 		case "up":
 			m.move(-1)
