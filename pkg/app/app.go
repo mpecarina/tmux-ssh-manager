@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"tmux-ssh-manager/pkg/credentials"
@@ -36,6 +37,8 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 			return runAdd(args[1:], stdout)
 		case "cred":
 			return runCred(args[1:], stdout)
+		case "__askpass":
+			return runAskpass(args[1:], stdout)
 		case "print-ssh-config-path":
 			path, err := sshconfig.DefaultPrimaryPath()
 			if err != nil {
@@ -66,6 +69,29 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+
+	// Build host→user map for credential lookups.
+	hostUsers := make(map[string]string, len(hosts))
+	for _, h := range hosts {
+		hostUsers[h.Alias] = h.User
+	}
+
+	askpassScript := createAskpassScript()
+	if askpassScript != "" {
+		defer os.Remove(askpassScript)
+	}
+
+	hasCred := func(alias string) bool {
+		user := hostUsers[alias]
+		return credentials.Get(alias, user, "password") == nil
+	}
+
+	sess := tmuxrun.Session{
+		AskpassScript: askpassScript,
+		HostUsers:     hostUsers,
+		HasCredential: hasCred,
+	}
+
 	app := tmuxui.App{
 		Hosts:          hosts,
 		State:          store,
@@ -76,12 +102,14 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		AddHost:        sshconfig.AddHostToPrimary,
 		ExecCredential: credentialCommand,
 		InTmux:         tmuxrun.InTmux,
-		Connect:        sshCommand,
-		NewWindow:      tmuxrun.Session{}.NewWindow,
-		SplitVert:      tmuxrun.Session{}.SplitVertical,
-		SplitHoriz:     tmuxrun.Session{}.SplitHorizontal,
-		Tiled:          tmuxrun.Session{}.Tiled,
-		SetupLogging:   tmuxrun.Session{}.SetupPaneLogging,
+		Connect: func(alias string) *exec.Cmd {
+			return sshCommandWithAskpass(alias, hostUsers[alias], askpassScript, hasCred)
+		},
+		NewWindow:    sess.NewWindow,
+		SplitVert:    sess.SplitVertical,
+		SplitHoriz:   sess.SplitHorizontal,
+		Tiled:        sess.Tiled,
+		SetupLogging: sess.SetupPaneLogging,
 	}
 	return app.Run()
 }
@@ -300,6 +328,45 @@ func sshCommand(alias string) *exec.Cmd {
 	return cmd
 }
 
+func sshCommandWithAskpass(alias, user, askpassScript string, hasCred func(string) bool) *exec.Cmd {
+	cmd := exec.Command("ssh", alias)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if askpassScript != "" && hasCred != nil && hasCred(alias) {
+		env := append(os.Environ(),
+			"TSSM_HOST="+alias,
+			"TSSM_USER="+user,
+			"SSH_ASKPASS="+askpassScript,
+			"SSH_ASKPASS_REQUIRE=force",
+			"DISPLAY=1",
+		)
+		cmd.Env = env
+	}
+	return cmd
+}
+
+func createAskpassScript() string {
+	binPath, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	tmpDir := os.TempDir()
+	scriptPath := filepath.Join(tmpDir, fmt.Sprintf("tssm-askpass-%d.sh", os.Getpid()))
+	content := "#!/usr/bin/env bash\nexec " + shellQuote(binPath) + " __askpass --host \"$TSSM_HOST\" --user \"$TSSM_USER\" --kind password\n"
+	if err := os.WriteFile(scriptPath, []byte(content), 0o700); err != nil {
+		return ""
+	}
+	return scriptPath
+}
+
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
 func connectInPlace(alias string) error {
 	return execSSH(alias, os.Stdin, os.Stdout, os.Stderr)
 }
@@ -310,4 +377,25 @@ func execSSH(alias string, stdin io.Reader, stdout, stderr io.Writer) error {
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	return cmd.Run()
+}
+
+func runAskpass(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("__askpass", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var host, user, kind string
+	fs.StringVar(&host, "host", "", "Host alias")
+	fs.StringVar(&user, "user", "", "Username")
+	fs.StringVar(&kind, "kind", "password", "Credential kind")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(host) == "" {
+		return fmt.Errorf("usage: tmux-ssh-manager __askpass --host <alias> [--user <user>] [--kind password]")
+	}
+	secret, err := credentials.Reveal(host, user, kind)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprint(stdout, secret)
+	return err
 }

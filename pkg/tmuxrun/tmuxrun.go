@@ -10,7 +10,11 @@ import (
 	"time"
 )
 
-type Session struct{}
+type Session struct {
+	AskpassScript string
+	HostUsers     map[string]string
+	HasCredential func(alias string) bool
+}
 
 func InTmux() bool {
 	return strings.TrimSpace(os.Getenv("TMUX")) != ""
@@ -69,6 +73,20 @@ func SSHCommand(alias string) string {
 	return fmt.Sprintf("exec ssh %s", shellQuote(alias))
 }
 
+func (s Session) sshCommand(alias string) string {
+	if s.AskpassScript != "" && s.HasCredential != nil && s.HasCredential(alias) {
+		user := ""
+		if s.HostUsers != nil {
+			user = s.HostUsers[alias]
+		}
+		return fmt.Sprintf(
+			"export TSSM_HOST=%s TSSM_USER=%s SSH_ASKPASS=%s SSH_ASKPASS_REQUIRE=force DISPLAY=1; exec ssh %s",
+			shellQuote(alias), shellQuote(user), shellQuote(s.AskpassScript), shellQuote(alias),
+		)
+	}
+	return SSHCommand(alias)
+}
+
 func loginShell() string {
 	if shell := strings.TrimSpace(os.Getenv("SHELL")); shell != "" {
 		return shell
@@ -77,7 +95,7 @@ func loginShell() string {
 }
 
 func (s Session) NewWindow(alias string) error {
-	paneID, err := s.output("new-window", "-P", "-F", "#{pane_id}", "-n", alias, loginShell(), "-lc", SSHCommand(alias))
+	paneID, err := s.output("new-window", "-P", "-F", "#{pane_id}", "-n", alias, loginShell(), "-lc", s.sshCommand(alias))
 	if err != nil {
 		return err
 	}
@@ -86,7 +104,7 @@ func (s Session) NewWindow(alias string) error {
 }
 
 func (s Session) SplitVertical(alias string) error {
-	paneID, err := s.output("split-window", "-P", "-F", "#{pane_id}", "-v", "-c", "#{pane_current_path}", loginShell(), "-lc", SSHCommand(alias))
+	paneID, err := s.output("split-window", "-P", "-F", "#{pane_id}", "-v", "-c", "#{pane_current_path}", loginShell(), "-lc", s.sshCommand(alias))
 	if err != nil {
 		return err
 	}
@@ -95,7 +113,7 @@ func (s Session) SplitVertical(alias string) error {
 }
 
 func (s Session) SplitHorizontal(alias string) error {
-	paneID, err := s.output("split-window", "-P", "-F", "#{pane_id}", "-h", "-c", "#{pane_current_path}", loginShell(), "-lc", SSHCommand(alias))
+	paneID, err := s.output("split-window", "-P", "-F", "#{pane_id}", "-h", "-c", "#{pane_current_path}", loginShell(), "-lc", s.sshCommand(alias))
 	if err != nil {
 		return err
 	}
@@ -116,7 +134,7 @@ func (s Session) Tiled(aliases []string, layout string) error {
 	}
 
 	// First host → new window.
-	windowID, err := s.output("new-window", "-P", "-F", "#{window_id}", "-n", "tiled", loginShell(), "-lc", SSHCommand(aliases[0]))
+	windowID, err := s.output("new-window", "-P", "-F", "#{window_id}", "-n", "tiled", loginShell(), "-lc", s.sshCommand(aliases[0]))
 	if err != nil {
 		return err
 	}
@@ -127,7 +145,7 @@ func (s Session) Tiled(aliases []string, layout string) error {
 
 	// Remaining hosts → splits within that window.
 	for _, alias := range aliases[1:] {
-		paneID, serr := s.output("split-window", "-P", "-F", "#{pane_id}", "-v", "-t", windowID, loginShell(), "-lc", SSHCommand(alias))
+		paneID, serr := s.output("split-window", "-P", "-F", "#{pane_id}", "-v", "-t", windowID, loginShell(), "-lc", s.sshCommand(alias))
 		if serr != nil {
 			return serr
 		}

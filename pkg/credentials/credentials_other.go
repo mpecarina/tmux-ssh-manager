@@ -13,3 +13,7 @@ func Get(host, user, kind string) error {
 func Delete(host, user, kind string) error {
 	return ErrUnsupported
 }
+
+func Reveal(host, user, kind string) (string, error) {
+	return "", ErrUnsupported
+}

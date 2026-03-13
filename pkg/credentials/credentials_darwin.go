@@ -131,6 +131,29 @@ func defaultPromptSecret(prompt string) (string, error) {
 	return strings.TrimRight(secret, "\r\n"), nil
 }
 
+func Reveal(host, user, kind string) (string, error) {
+	host, err := normalizeHost(host)
+	if err != nil {
+		return "", err
+	}
+	user = normalizeUser(host, user)
+
+	out, err := runSecurityCommand(
+		"find-generic-password",
+		"-w",
+		"-s", serviceName(host, kind),
+		"-a", user,
+	)
+	if err != nil {
+		return "", fmt.Errorf("credential not found for %s", itemLabel(host, user, kind))
+	}
+	secret := strings.TrimRight(out, "\r\n")
+	if secret == "" {
+		return "", fmt.Errorf("empty credential for %s", itemLabel(host, user, kind))
+	}
+	return secret, nil
+}
+
 func runStty(tty *os.File, mode string) error {
 	cmd := exec.Command("stty", mode)
 	cmd.Stdin = tty
