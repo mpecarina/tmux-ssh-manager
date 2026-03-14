@@ -18,6 +18,22 @@ The only host inventory is `~/.ssh/config` (including `Include` directives). No 
 
 ### As a tmux plugin
 
+#### With TPM
+
+Add to your `tmux.conf`:
+
+```tmux
+set -g @plugin 'tmux-plugins/tpm'
+set -g @plugin 'mpecarina/tmux-ssh-manager'
+
+# initialize TPM (keep this at the bottom of tmux.conf)
+run '~/.tmux/plugins/tpm/tpm'
+```
+
+Reload tmux, then press `prefix` + `I` to install.
+
+#### Without TPM
+
 Add to your `tmux.conf`:
 
 ```tmux
