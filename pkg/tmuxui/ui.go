@@ -192,6 +192,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) handlePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.input.Focused() {
 		switch msg.String() {
+		case "ctrl+c":
+			m.quitting = true
+			return m, tea.Quit
 		case "esc":
 			m.input.Blur()
 			return m, nil
