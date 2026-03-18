@@ -241,3 +241,75 @@ func TestRunConnectParsesLayoutFlags(t *testing.T) {
 		t.Fatalf("dry-run output = %q, want %q", got, "ssh edge1")
 	}
 }
+
+func TestExtractSSHCredentialTargetUserAtHost(t *testing.T) {
+	target := extractSSHCredentialTarget("ssh", []string{"matt@edge1"})
+	if target.host != "edge1" || target.user != "matt" {
+		t.Fatalf("unexpected target: %+v", target)
+	}
+}
+
+func TestExtractSSHCredentialTargetUserFlag(t *testing.T) {
+	target := extractSSHCredentialTarget("ssh", []string{"-l", "matt", "edge1"})
+	if target.host != "edge1" || target.user != "matt" {
+		t.Fatalf("unexpected target: %+v", target)
+	}
+}
+
+func TestExtractSSHCredentialTargetOptionUserFlag(t *testing.T) {
+	target := extractSSHCredentialTarget("ssh", []string{"-o", "User=matt", "edge1"})
+	if target.host != "edge1" || target.user != "matt" {
+		t.Fatalf("unexpected target: %+v", target)
+	}
+}
+
+func TestExtractSSHCredentialTargetForScp(t *testing.T) {
+	target := extractSSHCredentialTarget("scp", []string{"file.txt", "matt@edge1:/tmp/file.txt"})
+	if target.host != "edge1" || target.user != "matt" {
+		t.Fatalf("unexpected target: %+v", target)
+	}
+}
+
+func TestResolveCredentialUserFallsBackToGenericCredential(t *testing.T) {
+	originalGet := credGet
+	t.Cleanup(func() {
+		credGet = originalGet
+	})
+
+	credGet = func(host, user, kind string) error {
+		if host == "edge1" && user == "" && kind == "password" {
+			return nil
+		}
+		return os.ErrNotExist
+	}
+
+	got, ok := resolveCredentialUser("edge1", "matt")
+	if !ok {
+		t.Fatal("expected generic credential fallback")
+	}
+	if got != "" {
+		t.Fatalf("expected generic credential fallback, got %q", got)
+	}
+}
+
+func TestResolveCredentialUserPrefersExplicitUser(t *testing.T) {
+	originalGet := credGet
+	t.Cleanup(func() {
+		credGet = originalGet
+	})
+
+	credGet = func(host, user, kind string) error {
+		if host == "edge1" && user == "matt" && kind == "password" {
+			return nil
+		}
+		return os.ErrNotExist
+	}
+
+	got, ok := resolveCredentialUser("edge1", "matt", "config-user")
+	if !ok {
+		t.Fatal("expected explicit user credential match")
+	}
+	if got != "matt" {
+		t.Fatalf("expected explicit user, got %q", got)
+	}
+}

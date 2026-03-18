@@ -417,21 +417,21 @@ func runSSHPassthrough(binary string, args []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	// Try to extract the destination host and inject askpass if a credential exists.
-	if dest := extractSSHDestination(binary, args); dest != "" {
+	// Resolve the destination host/user and inject askpass if a stored credential matches.
+	if dest := extractSSHCredentialTarget(binary, args); dest.host != "" {
 		hosts, loadErr := sshconfig.LoadDefault()
 		if loadErr == nil {
 			hostUsers := make(map[string]string, len(hosts))
 			for _, h := range hosts {
 				hostUsers[h.Alias] = h.User
 			}
-			user := hostUsers[dest]
-			if credentials.Get(dest, user, "password") == nil {
+			user, ok := resolveCredentialUser(dest.host, dest.user, hostUsers[dest.host])
+			if ok {
 				script := createAskpassScript()
 				if script != "" {
 					defer os.Remove(script)
 					cmd.Env = append(os.Environ(),
-						"TSSM_HOST="+dest,
+						"TSSM_HOST="+dest.host,
 						"TSSM_USER="+user,
 						"SSH_ASKPASS="+script,
 						"SSH_ASKPASS_REQUIRE=force",
@@ -445,11 +445,16 @@ func runSSHPassthrough(binary string, args []string) error {
 	return cmd.Run()
 }
 
-// extractSSHDestination extracts the destination host from ssh/scp arguments.
-// For ssh: first non-flag argument (user@host or host).
-// For scp: first argument containing ':' gives the remote host.
-// Returns just the host part (strips user@ prefix).
-func extractSSHDestination(binary string, args []string) string {
+type sshCredentialTarget struct {
+	host string
+	user string
+}
+
+// extractSSHCredentialTarget extracts the destination host and user from ssh/scp arguments.
+// For ssh: the first non-flag argument is the destination. The user may come from
+// user@host, -l user, or -o User=<user>.
+// For scp: the first remote argument (user@host:path or host:path) is used.
+func extractSSHCredentialTarget(binary string, args []string) sshCredentialTarget {
 	// ssh flags that consume the next argument.
 	sshArgFlags := map[string]bool{
 		"-b": true, "-c": true, "-D": true, "-E": true, "-e": true,
@@ -457,13 +462,26 @@ func extractSSHDestination(binary string, args []string) string {
 		"-l": true, "-m": true, "-O": true, "-o": true, "-p": true,
 		"-Q": true, "-R": true, "-S": true, "-W": true, "-w": true,
 	}
+	var cliUser string
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--" {
 			break
 		}
+		if strings.HasPrefix(arg, "-oUser=") {
+			cliUser = strings.TrimPrefix(arg, "-oUser=")
+			continue
+		}
 		if strings.HasPrefix(arg, "-") {
+			if arg == "-l" && i+1 < len(args) {
+				cliUser = args[i+1]
+			}
+			if arg == "-o" && i+1 < len(args) {
+				if key, value, ok := splitSSHOption(args[i+1]); ok && strings.EqualFold(key, "User") {
+					cliUser = value
+				}
+			}
 			if sshArgFlags[arg] && i+1 < len(args) {
 				i++ // skip the flag's value
 			}
@@ -472,19 +490,50 @@ func extractSSHDestination(binary string, args []string) string {
 		// For scp, look for user@host:path or host:path patterns.
 		if binary == "scp" {
 			if idx := strings.Index(arg, ":"); idx > 0 {
-				return hostFromDestination(arg[:idx])
+				host, user := hostAndUserFromDestination(arg[:idx])
+				if cliUser != "" && user == "" {
+					user = cliUser
+				}
+				return sshCredentialTarget{host: host, user: user}
 			}
 			continue
 		}
 		// For ssh, the first non-flag arg is the destination.
-		return hostFromDestination(arg)
+		host, user := hostAndUserFromDestination(arg)
+		if cliUser != "" && user == "" {
+			user = cliUser
+		}
+		return sshCredentialTarget{host: host, user: user}
 	}
-	return ""
+	return sshCredentialTarget{}
 }
 
-func hostFromDestination(dest string) string {
+func hostAndUserFromDestination(dest string) (host, user string) {
 	if at := strings.LastIndex(dest, "@"); at >= 0 {
-		return dest[at+1:]
+		return dest[at+1:], dest[:at]
 	}
-	return dest
+	return dest, ""
+}
+
+func splitSSHOption(option string) (key, value string, ok bool) {
+	parts := strings.SplitN(option, "=", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), true
+}
+
+func resolveCredentialUser(host string, candidates ...string) (string, bool) {
+	seen := make(map[string]struct{}, len(candidates)+1)
+	for _, candidate := range append(candidates, "") {
+		candidate = strings.TrimSpace(candidate)
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		if credGet(host, candidate, "password") == nil {
+			return candidate, true
+		}
+	}
+	return "", false
 }
