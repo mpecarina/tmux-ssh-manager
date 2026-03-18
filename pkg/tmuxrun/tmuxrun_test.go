@@ -3,6 +3,7 @@ package tmuxrun
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -28,6 +29,33 @@ func TestSSHCommandEmptyAlias(t *testing.T) {
 	want := "exec ssh ''"
 	if got != want {
 		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestSessionSSHCommandDisablesPubkey(t *testing.T) {
+	s := Session{
+		AskpassScript: "/tmp/tssm-askpass.sh",
+		HostUsers:     map[string]string{"edge1": "admin"},
+		HasCredential: func(alias string) bool { return alias == "edge1" },
+	}
+	got := s.sshCommand("edge1")
+	if !strings.Contains(got, "PubkeyAuthentication=no") {
+		t.Fatalf("expected PubkeyAuthentication=no in command, got %q", got)
+	}
+	if !strings.Contains(got, "PreferredAuthentications=keyboard-interactive,password") {
+		t.Fatalf("expected PreferredAuthentications in command, got %q", got)
+	}
+}
+
+func TestSessionSSHCommandWithoutCredential(t *testing.T) {
+	s := Session{
+		AskpassScript: "/tmp/tssm-askpass.sh",
+		HostUsers:     map[string]string{"edge1": "admin"},
+		HasCredential: func(alias string) bool { return false },
+	}
+	got := s.sshCommand("edge1")
+	if strings.Contains(got, "PubkeyAuthentication") {
+		t.Fatalf("should not restrict auth when no credential, got %q", got)
 	}
 }
 

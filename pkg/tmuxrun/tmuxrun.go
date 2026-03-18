@@ -80,7 +80,7 @@ func (s Session) sshCommand(alias string) string {
 			user = s.HostUsers[alias]
 		}
 		return fmt.Sprintf(
-			"export TSSM_HOST=%s TSSM_USER=%s SSH_ASKPASS=%s SSH_ASKPASS_REQUIRE=force DISPLAY=1; exec ssh %s",
+			"export TSSM_HOST=%s TSSM_USER=%s SSH_ASKPASS=%s SSH_ASKPASS_REQUIRE=force DISPLAY=1; exec ssh -o PubkeyAuthentication=no -o PreferredAuthentications=keyboard-interactive,password %s",
 			shellQuote(alias), shellQuote(user), shellQuote(s.AskpassScript), shellQuote(alias),
 		)
 	}

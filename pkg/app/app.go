@@ -333,20 +333,28 @@ func sshCommand(alias string) *exec.Cmd {
 }
 
 func sshCommandWithAskpass(alias, user, askpassScript string, hasCred func(string) bool) *exec.Cmd {
-	cmd := exec.Command("ssh", alias)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 	if askpassScript != "" && hasCred != nil && hasCred(alias) {
-		env := append(os.Environ(),
+		cmd := exec.Command("ssh",
+			"-o", "PubkeyAuthentication=no",
+			"-o", "PreferredAuthentications=keyboard-interactive,password",
+			alias,
+		)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Env = append(os.Environ(),
 			"TSSM_HOST="+alias,
 			"TSSM_USER="+user,
 			"SSH_ASKPASS="+askpassScript,
 			"SSH_ASKPASS_REQUIRE=force",
 			"DISPLAY=1",
 		)
-		cmd.Env = env
+		return cmd
 	}
+	cmd := exec.Command("ssh", alias)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 	return cmd
 }
 
@@ -430,6 +438,17 @@ func runSSHPassthrough(binary string, args []string) error {
 				script := createAskpassScript()
 				if script != "" {
 					defer os.Remove(script)
+					// Disable pubkey auth so SSH doesn't burn auth attempts
+					// by sending the login password as key passphrases.
+					askpassArgs := []string{
+						"-o", "PubkeyAuthentication=no",
+						"-o", "PreferredAuthentications=keyboard-interactive,password",
+					}
+					askpassArgs = append(askpassArgs, args...)
+					cmd = exec.Command(binPath, askpassArgs...)
+					cmd.Stdin = os.Stdin
+					cmd.Stdout = os.Stdout
+					cmd.Stderr = os.Stderr
 					cmd.Env = append(os.Environ(),
 						"TSSM_HOST="+dest.host,
 						"TSSM_USER="+user,
