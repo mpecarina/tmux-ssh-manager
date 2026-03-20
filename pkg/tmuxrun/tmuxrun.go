@@ -177,11 +177,25 @@ func (s Session) SetupPaneLogging(alias string) {
 }
 
 func (s Session) setupLogging(paneID, alias string) {
+	if loggingDisabled() {
+		return
+	}
 	logPath, err := ensureLogFile(alias)
 	if err != nil {
 		return
 	}
-	_ = s.Run("pipe-pane", "-t", paneID, "-o", "cat >> "+shellQuote(logPath))
+	// Use output-only piping and discard any logger stderr so it can never
+	// interfere with the pane.
+	_ = s.Run("pipe-pane", "-O", "-t", paneID, "-o", "cat >> "+shellQuote(logPath)+" 2>/dev/null")
+}
+
+func loggingDisabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("TSSM_DISABLE_LOGGING"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // LogDir returns the log directory path for a host alias.
