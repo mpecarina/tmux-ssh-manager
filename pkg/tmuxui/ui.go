@@ -43,6 +43,7 @@ func (a App) Run() error {
 	// If those responses escape the TUI lifecycle, they can be interpreted as
 	// user input by the next exec'd program (ssh) or your shell.
 	restore := disableTermQueries()
+	defer restore()
 
 	program := tea.NewProgram(
 		newModel(a),
@@ -50,10 +51,9 @@ func (a App) Run() error {
 		tea.WithOutput(os.Stdout),
 		tea.WithAltScreen(),
 	)
+	defer func() { _ = program.ReleaseTerminal() }()
 
 	final, err := program.Run()
-	_ = program.ReleaseTerminal()
-	restore()
 	if err != nil {
 		return err
 	}

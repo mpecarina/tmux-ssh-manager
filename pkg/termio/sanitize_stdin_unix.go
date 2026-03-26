@@ -23,6 +23,16 @@ func debugStdinDrainEnabled() bool {
 	return v != "0" && v != "false" && v != "no"
 }
 
+func debugStdinDrainf(stderr io.Writer, format string, args ...any) {
+	if !debugStdinDrainEnabled() {
+		return
+	}
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+	_, _ = fmt.Fprintf(stderr, "tmux-ssh-manager: "+format+"\n", args...)
+}
+
 // SanitizeStdinBeforeExec drains stray terminal reply bytes from stdin.
 //
 // Some terminals write replies to OSC/DSR queries (e.g. OSC 11 background color,
@@ -34,21 +44,26 @@ func debugStdinDrainEnabled() bool {
 // stdin is quiet for quietFor (bounded by maxTotal), then restore original flags.
 func SanitizeStdinBeforeExec(stdin *os.File, stderr io.Writer) {
 	if stdin == nil {
+		debugStdinDrainf(stderr, "sanitize stdin: skipped (stdin is nil)")
 		return
 	}
 	fd := int(stdin.Fd())
 	if fd <= 0 {
+		debugStdinDrainf(stderr, "sanitize stdin: skipped (invalid fd=%d)", fd)
 		return
 	}
 	if !isatty.IsTerminal(uintptr(fd)) {
+		debugStdinDrainf(stderr, "sanitize stdin: skipped (stdin is not a TTY)")
 		return
 	}
 
 	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
 	if err != nil {
+		debugStdinDrainf(stderr, "sanitize stdin: skipped (fcntl F_GETFL failed: %v)", err)
 		return
 	}
 	if err := unix.SetNonblock(fd, true); err != nil {
+		debugStdinDrainf(stderr, "sanitize stdin: skipped (set nonblock failed: %v)", err)
 		return
 	}
 	defer func() {
@@ -85,23 +100,31 @@ func SanitizeStdinBeforeExec(stdin *os.File, stderr io.Writer) {
 			continue
 		}
 		if rerr == nil {
+			// EOF
 			break
 		}
 		if rerr != unix.EAGAIN && rerr != unix.EWOULDBLOCK {
+			debugStdinDrainf(stderr, "sanitize stdin: stopped (read error: %v)", rerr)
 			break
 		}
 		if time.Since(lastRead) >= quietFor {
 			break
 		}
 		if time.Since(start) >= maxTotal {
+			debugStdinDrainf(stderr, "sanitize stdin: stopped (maxTotal=%s reached; drained=%d)", maxTotal.String(), drained)
 			break
 		}
 		time.Sleep(sleepStep)
 	}
 
+	if debug && drained == 0 {
+		debugStdinDrainf(stderr, "sanitize stdin: no bytes drained")
+	}
+
 	if debug && drained > 0 {
 		hexStr := strings.TrimSpace(hex.EncodeToString(sample))
 		if hexStr == "" {
+			debugStdinDrainf(stderr, "sanitize stdin: drained %d bytes (no sample available)", drained)
 			return
 		}
 		// Group into pairs for readability.
