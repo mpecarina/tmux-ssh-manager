@@ -199,7 +199,7 @@ func runConnect(args []string, stdin io.Reader, stdout, stderr io.Writer) error 
 	if *splitCount > 1 {
 		return runConnectSplit(alias, *splitCount, *splitMode, *layout)
 	}
-	return execSSH(alias, stdin, stdout, stderr)
+	return execConnectWithAskpass(alias, stdin, stdout, stderr)
 }
 
 func runConnectSplit(alias string, count int, mode, layout string) error {
@@ -381,12 +381,45 @@ func shellQuote(s string) string {
 }
 
 func connectInPlace(alias string) error {
-	return execSSH(alias, os.Stdin, os.Stdout, os.Stderr)
+	return execConnectWithAskpass(alias, os.Stdin, os.Stdout, os.Stderr)
 }
 
 func execSSH(alias string, stdin io.Reader, stdout, stderr io.Writer) error {
 	termio.SanitizeStdinBeforeExec(os.Stdin, os.Stderr)
 	cmd := exec.Command("ssh", alias)
+	cmd.Stdin = stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	return cmd.Run()
+}
+
+func execConnectWithAskpass(alias string, stdin io.Reader, stdout, stderr io.Writer) error {
+	// Drain any stray terminal reply bytes before starting SSH.
+	termio.SanitizeStdinBeforeExec(os.Stdin, os.Stderr)
+
+	hosts, err := sshconfig.LoadDefault()
+	if err != nil {
+		// Fall back to plain ssh if we can't load config.
+		return execSSH(alias, stdin, stdout, stderr)
+	}
+
+	hostUsers := make(map[string]string, len(hosts))
+	for _, h := range hosts {
+		hostUsers[h.Alias] = h.User
+	}
+
+	askpassScript := createAskpassScript()
+	if askpassScript != "" {
+		defer os.Remove(askpassScript)
+	}
+
+	hasCred := func(a string) bool {
+		user := hostUsers[a]
+		return credentials.Get(a, user, "password") == nil
+	}
+
+	cmd := sshCommandWithAskpass(alias, hostUsers[alias], askpassScript, hasCred)
+	// Ensure we respect the caller's stdio (important for non-picker flows).
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
