@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -877,15 +878,42 @@ func drainTTYInput() {
 	}
 	defer func() { _ = unix.SetNonblock(fd, false) }()
 
-	buf := make([]byte, 1024)
-	for i := 0; i < 64; i++ {
-		_, err := unix.Read(fd, buf)
-		if err == nil {
-			continue
-		}
-		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+	buf := make([]byte, 4096)
+	quietPoll := 20 * time.Millisecond
+	deadline := time.Now().Add(200 * time.Millisecond)
+
+	for {
+		// Drain everything immediately available.
+		for i := 0; i < 256; i++ {
+			_, err := unix.Read(fd, buf)
+			if err == nil {
+				continue
+			}
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				break
+			}
 			return
 		}
-		return
+
+		// Some terminals reply *after* we start draining; wait briefly for late bytes.
+		if time.Now().After(deadline) {
+			return
+		}
+		wait := quietPoll
+		if remaining := time.Until(deadline); remaining < wait {
+			wait = remaining
+		}
+		if wait <= 0 {
+			return
+		}
+
+		pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+		n, err := unix.Poll(pfd, int(wait.Milliseconds()))
+		if err != nil {
+			return
+		}
+		if n == 0 {
+			return
+		}
 	}
 }
