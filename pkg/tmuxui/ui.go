@@ -2,6 +2,7 @@ package tmuxui
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/sys/unix"
 
 	"tmux-ssh-manager/pkg/sshconfig"
 	"tmux-ssh-manager/pkg/state"
@@ -356,9 +358,11 @@ func (m model) handlePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		_ = state.Save(m.app.StatePath, m.app.State)
 		m.enableLogging(current.host.Alias)
 		cmd := m.app.Connect(current.host.Alias)
-		return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
-			return quitMsg{}
-		})
+		execCmd := tea.ExecProcess(cmd, func(err error) tea.Msg { return quitMsg{} })
+		return m, func() tea.Msg {
+			drainTTYInput()
+			return execCmd()
+		}
 	default:
 		m.pendingG = false
 		return m, nil
@@ -572,9 +576,11 @@ func (m model) enterDefault() (tea.Model, tea.Cmd) {
 	default:
 		m.enableLogging(current.host.Alias)
 		cmd := m.app.Connect(current.host.Alias)
-		return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
-			return quitMsg{}
-		})
+		execCmd := tea.ExecProcess(cmd, func(err error) tea.Msg { return quitMsg{} })
+		return m, func() tea.Msg {
+			drainTTYInput()
+			return execCmd()
+		}
 	}
 }
 
@@ -848,4 +854,38 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// drainTTYInput discards any pending bytes already buffered on stdin.
+//
+// Some terminals respond to OSC/DSR queries (e.g. OSC 11 background-color, DSR
+// cursor position) by writing escape sequences back to the app's stdin. If a TUI
+// exits without consuming those responses, the next exec'd program (ssh) can
+// inherit them as "typed" input and forward them to the remote shell.
+func drainTTYInput() {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return
+	}
+	if fi.Mode()&os.ModeCharDevice == 0 {
+		return
+	}
+
+	fd := int(os.Stdin.Fd())
+	if err := unix.SetNonblock(fd, true); err != nil {
+		return
+	}
+	defer func() { _ = unix.SetNonblock(fd, false) }()
+
+	buf := make([]byte, 1024)
+	for i := 0; i < 64; i++ {
+		_, err := unix.Read(fd, buf)
+		if err == nil {
+			continue
+		}
+		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+			return
+		}
+		return
+	}
 }
