@@ -6,12 +6,11 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"golang.org/x/sys/unix"
+	"github.com/muesli/termenv"
 
 	"tmux-ssh-manager/pkg/sshconfig"
 	"tmux-ssh-manager/pkg/state"
@@ -36,7 +35,26 @@ type App struct {
 }
 
 func (a App) Run() error {
-	program := tea.NewProgram(newModel(a), tea.WithAltScreen())
+	// Disable terminal capability probing while the picker is running.
+	//
+	// Lipgloss (via termenv) can trigger terminal OSC/DSR queries (e.g. OSC 11,
+	// DSR cursor position). Some terminals write the responses back onto stdin.
+	// If those responses escape the TUI lifecycle, they can be interpreted as
+	// user input by the next exec'd program (ssh) or your shell.
+	restore := disableTermQueries()
+	defer restore()
+
+	program := tea.NewProgram(
+		newModel(a),
+		tea.WithInput(os.Stdin),
+		tea.WithOutput(os.Stdout),
+		tea.WithAltScreen(),
+	)
+
+	defer func() {
+		_ = program.ReleaseTerminal()
+	}()
+
 	_, err := program.Run()
 	return err
 }
@@ -360,15 +378,9 @@ func (m model) handlePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.enableLogging(current.host.Alias)
 		cmd := m.app.Connect(current.host.Alias)
 		execCmd := tea.ExecProcess(cmd, func(err error) tea.Msg {
-			// Drain again after ssh exits so terminal replies produced during the SSH
-			// session don't get "typed" into the local shell.
-			drainTTYInput()
 			return quitMsg{}
 		})
-		return m, func() tea.Msg {
-			drainTTYInput()
-			return execCmd()
-		}
+		return m, execCmd
 	default:
 		m.pendingG = false
 		return m, nil
@@ -583,15 +595,9 @@ func (m model) enterDefault() (tea.Model, tea.Cmd) {
 		m.enableLogging(current.host.Alias)
 		cmd := m.app.Connect(current.host.Alias)
 		execCmd := tea.ExecProcess(cmd, func(err error) tea.Msg {
-			// Drain again after ssh exits so terminal replies produced during the SSH
-			// session don't get "typed" into the local shell.
-			drainTTYInput()
 			return quitMsg{}
 		})
-		return m, func() tea.Msg {
-			drainTTYInput()
-			return execCmd()
-		}
+		return m, execCmd
 	}
 }
 
@@ -867,63 +873,29 @@ func min(a, b int) int {
 	return b
 }
 
-// drainTTYInput discards any pending bytes already buffered on stdin.
+// disableTermQueries best-effort disables terminal capability probing.
 //
 // Some terminals respond to OSC/DSR queries (e.g. OSC 11 background-color, DSR
-// cursor position) by writing escape sequences back to the app's stdin. If a TUI
-// exits without consuming those responses, the next exec'd program (ssh) can
-// inherit them as "typed" input and forward them to the remote shell.
-func drainTTYInput() {
-	fi, err := os.Stdin.Stat()
-	if err != nil {
-		return
-	}
-	if fi.Mode()&os.ModeCharDevice == 0 {
-		return
-	}
+// cursor position) by writing escape sequences back to the app's stdin. If those
+// responses escape the TUI lifecycle, the next exec'd program (ssh) or your
+// local shell can interpret them as literal input.
+func disableTermQueries() func() {
+	// Lipgloss uses termenv for terminal capability detection.
+	//
+	// Some detection paths can send OSC/DSR queries (like OSC 11), which can
+	// cause certain terminals to write replies back onto stdin. If those replies
+	// outlive the TUI, they can leak into the next program as literal input.
+	//
+	// Force a fixed profile for the duration of the picker.
+	prevOut := termenv.DefaultOutput()
+	prevProfile := lipgloss.ColorProfile()
 
-	fd := int(os.Stdin.Fd())
-	if err := unix.SetNonblock(fd, true); err != nil {
-		return
-	}
-	defer func() { _ = unix.SetNonblock(fd, false) }()
+	forced := termenv.NewOutput(os.Stdout, termenv.WithProfile(termenv.ANSI256), termenv.WithTTY(true))
+	termenv.SetDefaultOutput(forced)
+	lipgloss.SetColorProfile(termenv.ANSI256)
 
-	buf := make([]byte, 4096)
-	quietPoll := 20 * time.Millisecond
-	deadline := time.Now().Add(200 * time.Millisecond)
-
-	for {
-		// Drain everything immediately available.
-		for i := 0; i < 256; i++ {
-			_, err := unix.Read(fd, buf)
-			if err == nil {
-				continue
-			}
-			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-				break
-			}
-			return
-		}
-
-		// Some terminals reply *after* we start draining; wait briefly for late bytes.
-		if time.Now().After(deadline) {
-			return
-		}
-		wait := quietPoll
-		if remaining := time.Until(deadline); remaining < wait {
-			wait = remaining
-		}
-		if wait <= 0 {
-			return
-		}
-
-		pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
-		n, err := unix.Poll(pfd, int(wait.Milliseconds()))
-		if err != nil {
-			return
-		}
-		if n == 0 {
-			return
-		}
+	return func() {
+		termenv.SetDefaultOutput(prevOut)
+		lipgloss.SetColorProfile(prevProfile)
 	}
 }
