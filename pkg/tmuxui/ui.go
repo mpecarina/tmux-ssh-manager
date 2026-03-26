@@ -14,6 +14,7 @@ import (
 
 	"tmux-ssh-manager/pkg/sshconfig"
 	"tmux-ssh-manager/pkg/state"
+	"tmux-ssh-manager/pkg/termio"
 )
 
 type App struct {
@@ -42,7 +43,6 @@ func (a App) Run() error {
 	// If those responses escape the TUI lifecycle, they can be interpreted as
 	// user input by the next exec'd program (ssh) or your shell.
 	restore := disableTermQueries()
-	defer restore()
 
 	program := tea.NewProgram(
 		newModel(a),
@@ -51,12 +51,17 @@ func (a App) Run() error {
 		tea.WithAltScreen(),
 	)
 
-	defer func() {
-		_ = program.ReleaseTerminal()
-	}()
-
-	_, err := program.Run()
-	return err
+	final, err := program.Run()
+	_ = program.ReleaseTerminal()
+	restore()
+	if err != nil {
+		return err
+	}
+	if m, ok := final.(model); ok && m.execAfterExit != nil {
+		termio.SanitizeStdinBeforeExec(os.Stdin, os.Stderr)
+		return m.execAfterExit.Run()
+	}
+	return nil
 }
 
 type candidate struct {
@@ -104,6 +109,7 @@ type model struct {
 	height          int
 	pendingG        bool
 	quitting        bool
+	execAfterExit   *exec.Cmd
 	helpStyle       lipgloss.Style
 	statusStyle     lipgloss.Style
 	selectedStyle   lipgloss.Style
@@ -113,7 +119,6 @@ type model struct {
 
 type errMsg struct{ err error }
 type actionMsg struct{ text string }
-type quitMsg struct{}
 
 func newModel(app App) model {
 	search := textinput.New()
@@ -195,9 +200,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case actionMsg:
 		m.status = msg.text
 		return m, nil
-	case quitMsg:
-		m.quitting = true
-		return m, tea.Quit
 	case tea.KeyMsg:
 		if m.showAddHost {
 			return m.handleAddHost(msg)
@@ -376,11 +378,9 @@ func (m model) handlePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.app.State.AddRecent(current.host.Alias)
 		_ = state.Save(m.app.StatePath, m.app.State)
 		m.enableLogging(current.host.Alias)
-		cmd := m.app.Connect(current.host.Alias)
-		execCmd := tea.ExecProcess(cmd, func(err error) tea.Msg {
-			return quitMsg{}
-		})
-		return m, execCmd
+		m.execAfterExit = m.app.Connect(current.host.Alias)
+		m.quitting = true
+		return m, tea.Quit
 	default:
 		m.pendingG = false
 		return m, nil
@@ -487,22 +487,10 @@ func (m model) handleCredential(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.credential.status = err.Error()
 			return m, nil
 		}
-		action := m.credential.action
-		host := m.credential.host
-		subject := host
-		if user != "" {
-			subject = user + "@" + host
-		}
 		m.showCredential = false
-		return m, tea.ExecProcess(cmd, func(execErr error) tea.Msg {
-			if execErr != nil {
-				return errMsg{err: execErr}
-			}
-			if action == "set" {
-				return actionMsg{text: "stored password for " + subject}
-			}
-			return actionMsg{text: "deleted password for " + subject}
-		})
+		m.execAfterExit = cmd
+		m.quitting = true
+		return m, tea.Quit
 	}
 
 	var cmd tea.Cmd
@@ -594,10 +582,9 @@ func (m model) enterDefault() (tea.Model, tea.Cmd) {
 	default:
 		m.enableLogging(current.host.Alias)
 		cmd := m.app.Connect(current.host.Alias)
-		execCmd := tea.ExecProcess(cmd, func(err error) tea.Msg {
-			return quitMsg{}
-		})
-		return m, execCmd
+		m.execAfterExit = cmd
+		m.quitting = true
+		return m, tea.Quit
 	}
 }
 
@@ -659,7 +646,7 @@ func (m model) runAction(action func() error, quit bool, success string) tea.Cmd
 			return errMsg{err: err}
 		}
 		if quit {
-			return quitMsg{}
+			return tea.Quit()
 		}
 		return actionMsg{text: success}
 	}

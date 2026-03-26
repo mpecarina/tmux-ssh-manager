@@ -119,8 +119,8 @@ func TestEnterWithMultiSelectUsesNewWindow(t *testing.T) {
 	}
 	// Execute the command to trigger the actions.
 	msg := cmd()
-	if _, ok := msg.(quitMsg); !ok {
-		t.Fatalf("expected quitMsg, got %T", msg)
+	if _, ok := msg.(tea.QuitMsg); !ok {
+		t.Fatalf("expected tea.QuitMsg, got %T", msg)
 	}
 	if len(opened) != 2 {
 		t.Fatalf("expected 2 windows opened, got %d: %v", len(opened), opened)
@@ -301,8 +301,8 @@ func TestEnterModeWindow(t *testing.T) {
 		t.Fatal("expected a command from enter with enter-mode=w")
 	}
 	msg := cmd()
-	if _, ok := msg.(quitMsg); !ok {
-		t.Fatalf("expected quitMsg, got %T", msg)
+	if _, ok := msg.(tea.QuitMsg); !ok {
+		t.Fatalf("expected tea.QuitMsg, got %T", msg)
 	}
 	if len(opened) != 1 || opened[0] != "h1" {
 		t.Fatalf("expected window opened for h1, got %v", opened)
@@ -364,8 +364,8 @@ func TestTiledMultiSelect(t *testing.T) {
 		t.Fatal("expected a command from t")
 	}
 	msg := cmd()
-	if _, ok := msg.(quitMsg); !ok {
-		t.Fatalf("expected quitMsg, got %T", msg)
+	if _, ok := msg.(tea.QuitMsg); !ok {
+		t.Fatalf("expected tea.QuitMsg, got %T", msg)
 	}
 	if len(tiledAliases) != 3 {
 		t.Fatalf("expected 3 tiled aliases, got %d: %v", len(tiledAliases), tiledAliases)
@@ -396,8 +396,8 @@ func TestTiledSingleHostFallsBackToWindow(t *testing.T) {
 		t.Fatal("expected a command from t")
 	}
 	msg := cmd()
-	if _, ok := msg.(quitMsg); !ok {
-		t.Fatalf("expected quitMsg, got %T", msg)
+	if _, ok := msg.(tea.QuitMsg); !ok {
+		t.Fatalf("expected tea.QuitMsg, got %T", msg)
 	}
 	if windowedAlias != "h1" {
 		t.Fatalf("expected h1, got %q", windowedAlias)
@@ -433,8 +433,8 @@ func TestTiledInSearchMode(t *testing.T) {
 		t.Fatal("expected a command from t after esc to normal mode")
 	}
 	msg := cmd()
-	if _, ok := msg.(quitMsg); !ok {
-		t.Fatalf("expected quitMsg, got %T", msg)
+	if _, ok := msg.(tea.QuitMsg); !ok {
+		t.Fatalf("expected tea.QuitMsg, got %T", msg)
 	}
 	if len(tiledAliases) != 2 {
 		t.Fatalf("expected 2 tiled aliases, got %d", len(tiledAliases))

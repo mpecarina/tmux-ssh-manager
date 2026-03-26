@@ -13,6 +13,7 @@ import (
 	"tmux-ssh-manager/pkg/credentials"
 	"tmux-ssh-manager/pkg/sshconfig"
 	"tmux-ssh-manager/pkg/state"
+	"tmux-ssh-manager/pkg/termio"
 	"tmux-ssh-manager/pkg/tmuxrun"
 	"tmux-ssh-manager/pkg/tmuxui"
 )
@@ -384,6 +385,7 @@ func connectInPlace(alias string) error {
 }
 
 func execSSH(alias string, stdin io.Reader, stdout, stderr io.Writer) error {
+	termio.SanitizeStdinBeforeExec(os.Stdin, os.Stderr)
 	cmd := exec.Command("ssh", alias)
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
