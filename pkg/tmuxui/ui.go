@@ -359,7 +359,12 @@ func (m model) handlePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		_ = state.Save(m.app.StatePath, m.app.State)
 		m.enableLogging(current.host.Alias)
 		cmd := m.app.Connect(current.host.Alias)
-		execCmd := tea.ExecProcess(cmd, func(err error) tea.Msg { return quitMsg{} })
+		execCmd := tea.ExecProcess(cmd, func(err error) tea.Msg {
+			// Drain again after ssh exits so terminal replies produced during the SSH
+			// session don't get "typed" into the local shell.
+			drainTTYInput()
+			return quitMsg{}
+		})
 		return m, func() tea.Msg {
 			drainTTYInput()
 			return execCmd()
@@ -577,7 +582,12 @@ func (m model) enterDefault() (tea.Model, tea.Cmd) {
 	default:
 		m.enableLogging(current.host.Alias)
 		cmd := m.app.Connect(current.host.Alias)
-		execCmd := tea.ExecProcess(cmd, func(err error) tea.Msg { return quitMsg{} })
+		execCmd := tea.ExecProcess(cmd, func(err error) tea.Msg {
+			// Drain again after ssh exits so terminal replies produced during the SSH
+			// session don't get "typed" into the local shell.
+			drainTTYInput()
+			return quitMsg{}
+		})
 		return m, func() tea.Msg {
 			drainTTYInput()
 			return execCmd()
